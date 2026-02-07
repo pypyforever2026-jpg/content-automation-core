@@ -1,6 +1,6 @@
 [project]
 name = "content-automation-core"
-version = "0.1.1"
+version = "0.1.2"
 description = "Core tools for content generation and uploading"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,8 +13,9 @@ dependencies = [
   "requests>=2.0.0"
 ]
 
-[tool.setuptools]
-packages = ["content_automation_core"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["content_automation_core*"]
 
 [build-system]
 requires = ["setuptools", "wheel"]
