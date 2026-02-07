@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+content_automation_core/__init__.py
+content_automation_core.egg-info/PKG-INFO
+content_automation_core.egg-info/SOURCES.txt
+content_automation_core.egg-info/dependency_links.txt
+content_automation_core.egg-info/requires.txt
+content_automation_core.egg-info/top_level.txt

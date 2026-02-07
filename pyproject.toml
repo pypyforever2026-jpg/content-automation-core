@@ -1,0 +1,21 @@
+[project]
+name = "content-automation-core"
+version = "0.1.0"
+description = "Core tools for content generation and uploading"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Soheilll_2006" }
+]
+
+dependencies = [
+  "selenium>=4.0.0",
+  "requests>=2.0.0"
+]
+
+[tool.setuptools]
+packages = ["content_automation_core"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
