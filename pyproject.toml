@@ -1,7 +1,7 @@
 [project]
 name = "content-automation-core"
-version = "0.1.4"
-description = "Core tools for content generation and uploading"
+version = "0.1.5"
+description = "Automation tools for content generation and uploading"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -10,8 +10,8 @@ authors = [
 
 dependencies = [
   "selenium>=4.0.0",
-  "requests>=2.0.0"
-  "webdriver-manager>=4.0.0"
+  "requests>=2.0.0",
+  "webdriver-manager>=4.0.0",
   "playwright>=1.40.0"
 ]
 
