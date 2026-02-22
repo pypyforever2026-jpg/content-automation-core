@@ -24,8 +24,9 @@ class GeminiImageGenerator:
     # -----------------------------
     # رفتارهای انسانی
     # -----------------------------
-    def human_sleep(self, a=0.3, b=1.2):
+    def human_sleep(a=0.3, b=1.2):
         time.sleep(random.uniform(a, b))
+
 
     def human_type(self, element, text):
         for ch in text:
@@ -119,9 +120,23 @@ class GeminiImageGenerator:
             except:
                 print("Selecting Image tool...")
 
-                self.human_mouse_move(page, "button.toolbox-drawer-button")
-                self.human_click(page, "button.toolbox-drawer-button")
-                self.human_sleep(1, 2)
+                tools_btn = page.get_by_role("button", name="Tools")
+                tools_btn.hover()
+                time.sleep(1)
+                tools_btn.click()
+                time.sleep(1)
+
+
+                # ✅ Fix: از filter+has_text بجای get_by_role(name=) استفاده می‌کنیم
+                create_img_btn = page.locator("button[role='menuitemcheckbox']").filter(
+                    has_text="Create image"
+                )
+                create_img_btn.hover()
+                time.sleep(1)
+
+                create_img_btn.click()
+                time.sleep(1)
+
 
                 create_img_btn = page.locator(
                     "//button[contains(@class,'mat-mdc-list-item')]"
