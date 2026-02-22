@@ -126,25 +126,14 @@ class GeminiImageGenerator:
                 tools_btn.click()
                 time.sleep(1)
 
-
                 # ✅ Fix: از filter+has_text بجای get_by_role(name=) استفاده می‌کنیم
                 create_img_btn = page.locator("button[role='menuitemcheckbox']").filter(
                     has_text="Create image"
                 )
                 create_img_btn.hover()
                 time.sleep(1)
-
                 create_img_btn.click()
-                time.sleep(1)
-
-
-                create_img_btn = page.locator(
-                    "//button[contains(@class,'mat-mdc-list-item')]"
-                    "//div[contains(text(),'Create images')]"
-                )
-                self.human_mouse_move(page, "//button[contains(@class,'mat-mdc-list-item')]")
-                create_img_btn.click()
-                self.human_sleep(2, 3)
+                time.sleep(2)
 
             # -----------------------------
             # نوشتن پرامپت
