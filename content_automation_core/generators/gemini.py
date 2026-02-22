@@ -24,7 +24,7 @@ class GeminiImageGenerator:
     # -----------------------------
     # رفتارهای انسانی
     # -----------------------------
-    def human_sleep(a=0.3, b=1.2):
+    def human_sleep(self,a=0.3, b=1.2):
         time.sleep(random.uniform(a, b))
 
 
