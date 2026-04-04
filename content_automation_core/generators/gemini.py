@@ -3,7 +3,6 @@ import time
 import uuid
 import random
 import re
-import base64
 from playwright.sync_api import sync_playwright
 
 
@@ -77,28 +76,17 @@ class GeminiImageGenerator:
     # دانلود تصویر — پشتیبانی از blob و http
     # ──────────────────────────────────────────
 
-    def download_image(self, page, context, image_url: str, filename: str) -> str:
+    def download_image(self, context, image_url: str, filename: str) -> str:
+        # اگه URL با blob: شروع میشه، اون پیشوند رو حذف کن
+        if image_url.startswith("blob:"):
+            image_url = image_url[len("blob:"):]
+            print("📦 Blob prefix stripped ->", image_url)
+
+        response = context.request.get(image_url)
         save_path = os.path.join(self.download_dir, filename)
 
-        if image_url.startswith("blob:"):
-            print("📦 Blob URL detected — using JS to extract...")
-            b64_data = page.evaluate("""async (url) => {
-                const response = await fetch(url);
-                const blob = await response.blob();
-                return new Promise(resolve => {
-                    const reader = new FileReader();
-                    reader.onloadend = () => resolve(reader.result);
-                    reader.readAsDataURL(blob);
-                });
-            }""", image_url)
-            # b64_data = "data:image/jpeg;base64,/9j/..."
-            raw = b64_data.split(",", 1)[1]
-            with open(save_path, "wb") as f:
-                f.write(base64.b64decode(raw))
-        else:
-            response = context.request.get(image_url)
-            with open(save_path, "wb") as f:
-                f.write(response.body())
+        with open(save_path, "wb") as f:
+            f.write(response.body())
 
         print("✅ Image downloaded:", save_path)
         return save_path
@@ -215,8 +203,7 @@ class GeminiImageGenerator:
 
             filename = self.unique_filename(prompt_text)
 
-            # ✅ ارسال page به download_image برای پشتیبانی از blob
-            saved_path = self.download_image(page, context, image_url, filename)
+            saved_path = self.download_image(context, image_url, filename)
 
             context.close()
             return saved_path
