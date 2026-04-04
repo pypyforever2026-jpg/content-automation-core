@@ -129,12 +129,13 @@ class InstagramUploader:
         else:
             print("🕹 Old Buffer UI detected")
             # hover روی channel container
-            container = self.page.locator(f"#{self.channel_id}")
+            # ✅ از [id='...'] بجای #id — چون CSS selector با digit شروع نمیشه
+            container = self.page.locator(f"[id='{self.channel_id}']")
             container.wait_for(state="visible", timeout=WAIT_MS)
             container.hover()
 
             # کلیک دکمه دوم (New Post)
-            btn = self.page.locator(f"#{self.channel_id} button:nth-child(2)")
+            btn = self.page.locator(f"[id='{self.channel_id}'] button:nth-child(2)")
             btn.wait_for(state="visible", timeout=WAIT_MS)
             btn.click()
 
