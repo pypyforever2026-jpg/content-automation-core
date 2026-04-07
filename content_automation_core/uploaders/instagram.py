@@ -167,6 +167,8 @@ class InstagramUploader:
             btn.wait_for(timeout=WAIT_MS)
             btn.click(force=True)
             print("✅ Publish clicked")
+            
+            self.page.wait_for_timeout(30000)  # اضافی: 5 ثانیه buffer
             return True
         except Exception as e:
             print("⚠️ Publish button not found:", e)
