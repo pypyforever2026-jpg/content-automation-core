@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
+import time
 WAIT_MS = 25_000
 
 class InstagramUploader:
@@ -186,7 +186,7 @@ class InstagramUploader:
 
             # منتظر visible شدن دکمه
             btn.wait_for(state="visible", timeout=15000)
-
+            time.sleep(3)
             # کلیک force (در صورتی که overlay جلوی دکمه باشد)
             btn.click(force=True)
             print("✅ Publish clicked")
