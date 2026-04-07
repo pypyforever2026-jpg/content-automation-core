@@ -92,20 +92,19 @@ class InstagramUploader:
                     print("⚠️ Caption write failed")
 
             # Click Now (schedule)
+            # Click Now (schedule) with JS
             try:
-                # 1️⃣ باز کردن منوی زمان‌بندی
                 schedule_btn = self.wait_for_clickable(By.CSS_SELECTOR, "button[data-schedule-trigger='true']")
                 self.driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", schedule_btn)
                 print("✅ Schedule menu opened")
-                time.sleep(1)
+                time.sleep(3)
 
-                # 2️⃣ کلیک روی گزینه Now
-                now_option = self.wait_for_clickable(By.XPATH, "//p[text()='Now']")
+                now_option = self.driver.find_element(By.XPATH, "//p[text()='Now']")
                 self.driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", now_option)
                 print("⏱ Publish set to Now")
                 time.sleep(1)
             except Exception as e:
-                print("⚠️ Now click failed:", e)
+                print("⚠️ Now click skipped (JS forced it anyway)")
 
             # Click Publish
             try:
