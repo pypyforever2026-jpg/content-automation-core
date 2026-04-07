@@ -93,15 +93,23 @@ class InstagramUploader:
 
             # Click Now (schedule)
             try:
-                now_option = self.wait_for_clickable(By.XPATH, "//p[text()='Now']")
-                now_option.click()
-                print("⏱ Publish set to Now")
-            except:
-                print("⚠️ Now click failed")
+                # 1️⃣ باز کردن منوی زمان‌بندی
+                schedule_btn = self.wait_for_clickable(By.CSS_SELECTOR, "button[data-schedule-trigger='true']")
+                self.driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", schedule_btn)
+                print("✅ Schedule menu opened")
+                time.sleep(1)
 
-            # Click Publish (force via JS)
+                # 2️⃣ کلیک روی گزینه Now
+                now_option = self.wait_for_clickable(By.XPATH, "//p[text()='Now']")
+                self.driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", now_option)
+                print("⏱ Publish set to Now")
+                time.sleep(1)
+            except Exception as e:
+                print("⚠️ Now click failed:", e)
+
+            # Click Publish
             try:
-                publish_btn = self.wait_for_element(By.CSS_SELECTOR, "button.publish_schedulePostButton_8XRSX")
+                publish_btn = self.wait_for_clickable(By.CSS_SELECTOR, "button.publish_schedulePostButton_8XRSX")
                 self.driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", publish_btn)
                 print("✅ Publish clicked")
                 time.sleep(30)  # wait for modal to close
