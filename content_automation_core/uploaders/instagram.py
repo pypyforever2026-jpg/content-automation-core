@@ -160,20 +160,55 @@ class InstagramUploader:
             print("⚠️ schedule 'Now' not found:", e)
             return False
 
+    # def click_publish(self):
+    #     """Click Publish button (handle both UIs)"""
+    #     try:
+    #         btn = self.page.locator("button:has-text('Publish'), button.publish_schedulePostButton_8XRSX").first
+    #         btn.wait_for(timeout=WAIT_MS)
+    #         btn.click(force=True)
+    #         print("✅ Publish clicked")
+            
+    #         self.page.wait_for_timeout(30000)  # اضافی: 5 ثانیه buffer
+    #         return True
+    #     except Exception as e:
+    #         print("⚠️ Publish button not found:", e)
+    #         return False
     def click_publish(self):
-        """Click Publish button (handle both UIs)"""
+        """Click Publish button (handle both old and new Buffer UIs)"""
         try:
-            btn = self.page.locator("button:has-text('Publish'), button.publish_schedulePostButton_8XRSX").first
-            btn.wait_for(timeout=WAIT_MS)
+            # پیدا کردن دکمه Publish
+            btn = self.page.locator(
+                "button.publish_schedulePostButton_8XRSX, button:has-text('Publish')"
+            ).first
+
+            # scroll به دکمه تا در viewport باشد
+            btn.scroll_into_view_if_needed(timeout=15000)
+
+            # منتظر visible شدن دکمه
+            btn.wait_for(state="visible", timeout=15000)
+
+            # کلیک force (در صورتی که overlay جلوی دکمه باشد)
             btn.click(force=True)
             print("✅ Publish clicked")
-            
-            self.page.wait_for_timeout(30000)  # اضافی: 5 ثانیه buffer
-            return True
-        except Exception as e:
-            print("⚠️ Publish button not found:", e)
-            return False
 
+            # صبر واقعی برای انتشار: حداقل 30 ثانیه
+            self.page.wait_for_timeout(30000)
+
+            # صبر برای بسته شدن modal بعد از انتشار
+            try:
+                self.page.locator("[role='dialog']").wait_for(state="hidden", timeout=35000)
+                print("✅ Post published and modal closed")
+            except:
+                print("⚠️ Modal did not close, publish may have issues")
+
+            # buffer safety اضافی
+            self.page.wait_for_timeout(5000)
+
+            return True
+
+        except Exception as e:
+            print("⚠️ Publish button not found or click failed:", e)
+            return False
     def wait_for_modal_close(self):
         try:
             self.page.locator("[role='dialog']").wait_for(state="hidden", timeout=20000)
