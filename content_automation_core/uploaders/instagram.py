@@ -1,61 +1,42 @@
 import os
-import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-
-WAIT_MS = 25_000   # 25 ثانیه (معادل WAIT_SEC=25 در سلنیوم)
+WAIT_MS = 25_000
 
 
 class InstagramUploader:
-    """
-    Instagram uploader for Buffer.com — Playwright version
-    - پشتیبانی از UI قدیم (channel container با ID) و UI جدید (Create new → Post)
-    - الگوریتم و سلکتورهای composer مطابق نسخه اصلی
-    """
 
     def __init__(self, profile_path: str, buffer_url: str):
-        """
-        profile_path : مسیر پروفایل کروم
-        buffer_url   : URL کانال Buffer
-        """
         self.profile_path = profile_path
         self.buffer_url = buffer_url
-        self.channel_id = self.extract_channel_id(buffer_url)
         self.page = None
         self.context = None
         self._playwright = None
 
-    # ──────────────────────────────────────────
-    # Driver Setup
-    # ──────────────────────────────────────────
+    # ─────────────────────────────
+    # Driver
+    # ─────────────────────────────
 
     def build_driver(self):
         self._playwright = sync_playwright().start()
 
         self.context = self._playwright.chromium.launch_persistent_context(
             user_data_dir=self.profile_path,
-            channel="chrome",               # کروم نصب‌شده روی سیستم
+            channel="chrome",
             headless=False,
-            no_viewport=True,               # پنجره با اندازه واقعی
+            no_viewport=True,
             ignore_default_args=["--enable-automation"],
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-notifications",
                 "--start-maximized",
-                "--disable-features=PrivacySandboxAdsAPIs",
                 "--no-sandbox",
-                "--disable-dev-shm-usage",
             ],
         )
 
-        # صفحه موجود یا جدید
-        if self.context.pages:
-            self.page = self.context.pages[0]
-        else:
-            self.page = self.context.new_page()
+        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
 
-        # مخفی کردن webdriver flag
         self.page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
@@ -66,205 +47,176 @@ class InstagramUploader:
                 self.context.close()
             if self._playwright:
                 self._playwright.stop()
-        except Exception:
+        except:
             pass
 
-    # ──────────────────────────────────────────
+    # ─────────────────────────────
     # Helpers
-    # ──────────────────────────────────────────
-
-    @staticmethod
-    def extract_channel_id(url: str) -> str:
-        return url.rstrip("/").split("/")[-1]
-
-    @staticmethod
-    def detect_media_type(file_path: str) -> str:
-        image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.svg', '.heic'}
-        video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm',
-                      '.3gp', '.mpeg', '.mpg', '.m4v', '.ts'}
-        ext = Path(file_path).suffix.lower()
-        if ext in image_exts:
-            return 'image'
-        if ext in video_exts:
-            return 'video'
-        return 'unknown'
+    # ─────────────────────────────
 
     def wait_page_ready(self):
         self.page.wait_for_load_state("domcontentloaded", timeout=WAIT_MS)
-        # صبر برای body یا channels-page
-        self.page.wait_for_selector(
-            "[data-testid='channels-page'], body",
-            timeout=WAIT_MS
-        )
+        self.page.wait_for_selector("body", timeout=WAIT_MS)
 
     def _has_new_ui(self) -> bool:
-        """بررسی وجود دکمه Create new (UI جدید بافر)"""
         try:
-            self.page.locator("button:has-text('Create new')").wait_for(
-                state="visible", timeout=5_000
-            )
+            self.page.locator("button[aria-haspopup='menu']").first.wait_for(timeout=6000)
             return True
-        except PlaywrightTimeoutError:
+        except:
             return False
 
-    # ──────────────────────────────────────────
-    # UI Actions
-    # ──────────────────────────────────────────
+    # ─────────────────────────────
+    # Open Composer (🔥 مهم‌ترین بخش)
+    # ─────────────────────────────
 
     def click_insta_profile(self):
-        """
-        UI قدیم : container کانال → دکمه دوم
-        UI جدید : Create new → Post
-        """
-        if self._has_new_ui():
-            print("🆕 New Buffer UI detected")
-            # کلیک Create new
-            self.page.locator("button:has-text('Create new')").click()
 
-            # صبر برای منو و کلیک روی Post
-            post_item = self.page.locator("[role='menuitem']:has(label:text-is('Post'))")
+        if self._has_new_ui():
+            print("🆕 New Buffer UI")
+
+            # Create new
+            create_btn = self.page.locator("button[aria-haspopup='menu']").first
+            create_btn.wait_for(state="visible", timeout=WAIT_MS)
+            create_btn.click()
+
+            # menu
+            self.page.locator("[role='menu']").wait_for(timeout=WAIT_MS)
+
+            # Post
+            post_item = self.page.locator("[role='menuitem']").filter(
+                has_text="Post"
+            ).first
+
             post_item.wait_for(state="visible", timeout=WAIT_MS)
             post_item.click()
 
         else:
-            print("🕹 Old Buffer UI detected")
-            # hover روی channel container
-            # ✅ از [id='...'] بجای #id — چون CSS selector با digit شروع نمیشه
-            container = self.page.locator(f"[id='{self.channel_id}']")
-            container.wait_for(state="visible", timeout=WAIT_MS)
-            container.hover()
+            print("🕹 Old Buffer UI (fallback)")
 
-            # کلیک دکمه دوم (New Post)
-            btn = self.page.locator(f"[id='{self.channel_id}'] button:nth-child(2)")
-            btn.wait_for(state="visible", timeout=WAIT_MS)
+            # انتخاب اینستاگرام (با icon یا text)
+            insta = self.page.locator("[data-channel='instagram']").first
+
+            if not insta.count():
+                insta = self.page.locator("text=Instagram").first
+
+            insta.wait_for(timeout=WAIT_MS)
+            insta.hover()
+
+            # دکمه New Post
+            btn = self.page.locator("button:has-text('New')").first
+
+            btn.wait_for(timeout=WAIT_MS)
             btn.click()
 
-    def click_reels(self) -> bool:
-        """انتخاب گزینه Reels"""
+    # ─────────────────────────────
+    # Actions
+    # ─────────────────────────────
+
+    def click_reels(self):
         try:
-            reels = self.page.locator("#reels")
-            reels.wait_for(state="visible", timeout=WAIT_MS)
+            reels = self.page.locator("#reels, text=Reels").first
+            reels.wait_for(timeout=WAIT_MS)
             reels.click()
-            return reels.is_checked()
-        except PlaywrightTimeoutError:
-            print("⚠️ Reels option not found")
+            return True
+        except:
+            print("⚠️ Reels not found")
             return False
 
     def write_caption(self, caption: str):
-        """نوشتن کپشن در textbox composer"""
-        box = self.page.locator("[data-testid='composer-text-area']")
-        box.wait_for(state="visible", timeout=WAIT_MS)
+        box = self.page.locator("[data-testid='composer-text-area'], [contenteditable='true']").first
+        box.wait_for(timeout=WAIT_MS)
         box.click()
 
-        # پاک‌کردن متن قبلی
         self.page.keyboard.press("Control+a")
         self.page.keyboard.press("Delete")
-
-        # تایپ کپشن (keyboard.type برای contenteditable بهتر از fill است)
         self.page.keyboard.type(caption)
 
-    def upload_file(self, file_path: str) -> bool:
-        """آپلود فایل رسانه"""
+    def upload_file(self, file_path: str):
+        file_input = self.page.locator("input[type='file']").first
+        file_input.wait_for(timeout=WAIT_MS)
+        file_input.set_input_files(file_path)
+
+    def is_media_uploaded(self):
         try:
-            file_input = self.page.locator("input[name='file-upload-input'][type='file']")
-            file_input.wait_for(state="attached", timeout=WAIT_MS)
-            file_input.set_input_files(file_path)
+            self.page.locator("[data-testid='media-attachment-thumbnail']").wait_for(timeout=30000)
             return True
-        except Exception as e:
-            print(f"⚠️ File upload error: {e}")
+        except:
             return False
 
-    def is_media_uploaded(self) -> bool:
-        """بررسی ظاهر شدن thumbnail رسانه"""
+    def send_type_now(self):
         try:
-            self.page.locator("button[data-testid='media-attachment-thumbnail']").wait_for(
-                state="visible", timeout=30_000
-            )
+            btn = self.page.locator("[data-testid='schedule-selector-trigger']").first
+            btn.wait_for(timeout=WAIT_MS)
+            btn.click()
+
+            now = self.page.locator("text=right away").first
+            now.wait_for(timeout=WAIT_MS)
+            now.click()
+
             return True
-        except PlaywrightTimeoutError:
+        except:
+            print("⚠️ schedule not found")
             return False
 
-    def send_type_now(self) -> bool:
-        """تغییر زمان‌بندی به Publish Now"""
+    def click_publish(self):
         try:
-            schedule_btn = self.page.locator("button[data-testid='schedule-selector-trigger']")
-            schedule_btn.wait_for(state="visible", timeout=WAIT_MS)
-            schedule_btn.click()
-
-            # کلیک روی گزینه «Publish right away»
-            publish_now = self.page.locator(
-                "small:text('Publish your post right away.')").locator("..")
-            publish_now.wait_for(state="visible", timeout=WAIT_MS)
-            publish_now.click()
-            return True
-        except PlaywrightTimeoutError:
-            print("⚠️ Schedule selector not found")
-            return False
-
-    def click_publish(self) -> bool:
-        """کلیک دکمه Publish Now نهایی"""
-        try:
-            btn = self.page.locator("button:text-is('Publish Now')")
-            btn.wait_for(state="visible", timeout=WAIT_MS)
+            btn = self.page.locator("button:has-text('Publish')").first
+            btn.wait_for(timeout=WAIT_MS)
             btn.click()
             return True
-        except PlaywrightTimeoutError:
-            print("⚠️ Publish Now button not found")
+        except:
+            print("⚠️ publish not found")
             return False
 
-    def wait_for_modal_close(self) -> bool:
-        """صبر برای بسته شدن modal"""
+    def wait_for_modal_close(self):
         try:
-            self.page.locator("[role='dialog']").wait_for(state="hidden", timeout=20_000)
+            self.page.locator("[role='dialog']").wait_for(state="hidden", timeout=20000)
             return True
-        except PlaywrightTimeoutError:
+        except:
             return False
 
-    # ──────────────────────────────────────────
-    # Main Upload Function
-    # ──────────────────────────────────────────
+    # ─────────────────────────────
+    # Main
+    # ─────────────────────────────
 
     def upload_reels(self, file_path: str, caption: str) -> bool:
+
         file_path = os.path.abspath(file_path)
-        media_type = self.detect_media_type(file_path)
 
         self.build_driver()
+
         try:
             self.page.goto(self.buffer_url)
             self.wait_page_ready()
 
-            self.page.evaluate("window.scrollTo(0, 0)")
+            # DEBUG (خیلی مهم)
+            self.page.screenshot(path="debug.png", full_page=True)
 
-            # ❶ باز کردن composer
+            # 1. باز کردن composer
             self.click_insta_profile()
 
-            # ❷ انتخاب Reels
+            # 2. reels
             self.click_reels()
 
-            # ❸ نوشتن کپشن
+            # 3. caption
             if caption:
                 self.write_caption(caption)
 
-            # ❹ آپلود فایل
+            # 4. upload
             self.upload_file(file_path)
 
-            # ❺ صبر برای پردازش
-            wait_upload = 20_000 if media_type == "image" else 60_000
-            self.page.wait_for_timeout(wait_upload)
+            self.page.wait_for_timeout(5000)
 
             if not self.is_media_uploaded():
-                print("⚠️ Media upload may have failed")
+                print("⚠️ upload maybe failed")
 
-            # ❻ تغییر به Publish Now و publish
+            # 5. publish
             self.send_type_now()
             self.click_publish()
 
-            # ❼ صبر برای تکمیل
-            wait_after = 30_000 if media_type == "image" else 60_000
-            self.page.wait_for_timeout(wait_after)
+            self.page.wait_for_timeout(10000)
 
             self.wait_for_modal_close()
-            self.page.wait_for_timeout(5_000)
 
             return True
 
@@ -272,11 +224,9 @@ class InstagramUploader:
             self.close_driver()
 
 
-# ──────────────────────────────────────────
-# Functional API (همان signature قبلی)
-# ──────────────────────────────────────────
+# API
 
 def upload_instagram_reels(file_path: str, caption: str,
                            profile_path: str, buffer_url: str) -> bool:
-    uploader = InstagramUploader(profile_path=profile_path, buffer_url=buffer_url)
+    uploader = InstagramUploader(profile_path, buffer_url)
     return uploader.upload_reels(file_path, caption)
