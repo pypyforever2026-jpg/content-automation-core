@@ -70,11 +70,14 @@ class InstagramUploader:
             print("🆕 New Buffer UI")
             create_btn = self.page.locator("button[aria-haspopup='menu']").first
             create_btn.wait_for(state="visible", timeout=WAIT_MS)
-            create_btn.click()
+            create_btn.click(force=True)
+
             self.page.locator("[role='menu']").wait_for(timeout=WAIT_MS)
-            post_item = self.page.locator("[role='menuitem']").filter(has_text="Post").first
+            post_item = self.page.locator("[role='menuitem']").filter(
+                has_text="Post"
+            ).first
             post_item.wait_for(state="visible", timeout=WAIT_MS)
-            post_item.click()
+            post_item.click(force=True)
         else:
             print("🕹 Old Buffer UI (fallback)")
             insta = self.page.locator("[data-channel='instagram']").first
@@ -84,24 +87,24 @@ class InstagramUploader:
             insta.hover()
             btn = self.page.locator("button:has-text('New')").first
             btn.wait_for(timeout=WAIT_MS)
-            btn.click()
+            btn.click(force=True)
 
     # ─────────────────────────────
     # Actions
     # ─────────────────────────────
 
     def click_reels(self):
-        """Click the Reels option (handle new and old UI)"""
+        """Click Reels (new UI: radio input, old UI: button)"""
         try:
             reels_input = self.page.locator("input#reels[type='radio']").first
             if reels_input.count():
-                reels_input.set_checked()
+                reels_input.set_checked(True)  # ⚡ Fix
                 print("🎬 Reels selected (new UI)")
                 return True
             reels_btn = self.page.locator("#reels, text=Reels").first
             if reels_btn.count():
                 reels_btn.wait_for(timeout=WAIT_MS)
-                reels_btn.click()
+                reels_btn.click(force=True)
                 print("🎬 Reels selected (old UI)")
                 return True
             print("⚠️ Reels not found")
@@ -119,19 +122,18 @@ class InstagramUploader:
         self.page.keyboard.type(caption)
 
     def upload_file(self, file_path: str):
-        """Upload file (handle new and old UI)"""
-        try:
-            file_input_btn = self.page.locator("button:has(input[type='file'])").first
-            if file_input_btn.count():
-                input_el = file_input_btn.locator("input[type='file']").first
-                input_el.set_input_files(os.path.abspath(file_path))
-                print("📁 File uploaded (new UI)")
-                return
-            file_input = self.page.locator("input[type='file']").first
+        file_input = self.page.locator("input[type='file']").first
+        if file_input.count():
             file_input.set_input_files(os.path.abspath(file_path))
-            print("📁 File uploaded (old UI)")
-        except Exception as e:
-            print("⚠️ File upload failed:", e)
+            print("📁 File uploaded (new UI)")
+        else:
+            # fallback old UI
+            upload_btn = self.page.locator("button.publish_uploadButton_wX99J").first
+            if upload_btn.count():
+                upload_btn.click(force=True)
+                hidden_input = upload_btn.locator("input[type='file']").first
+                hidden_input.set_input_files(os.path.abspath(file_path))
+                print("📁 File uploaded (old UI)")
 
     def is_media_uploaded(self):
         try:
@@ -141,14 +143,17 @@ class InstagramUploader:
             return False
 
     def send_type_now(self):
-        """Select 'Now' for publishing (new and old UI)"""
+        """Select 'Now' for publishing (handle both UIs)"""
         try:
+            # Open schedule dropdown
             schedule_btn = self.page.locator("[data-testid='schedule-selector-trigger'], button[data-schedule-trigger='true']").first
             schedule_btn.wait_for(timeout=WAIT_MS)
-            schedule_btn.click()
-            now_item = self.page.locator("text=Now, text=right away").first
+            schedule_btn.click(force=True)
+
+            # Select Now
+            now_item = self.page.locator("div[role='menuitem']:has-text('Now')").first
             now_item.wait_for(timeout=WAIT_MS)
-            now_item.click()
+            now_item.click(force=True)
             print("⏱ Publish set to Now")
             return True
         except Exception as e:
@@ -156,11 +161,11 @@ class InstagramUploader:
             return False
 
     def click_publish(self):
-        """Click the Publish button (handle new and old UI)"""
+        """Click Publish button (handle both UIs)"""
         try:
             btn = self.page.locator("button:has-text('Publish'), button.publish_schedulePostButton_8XRSX").first
             btn.wait_for(timeout=WAIT_MS)
-            btn.click()
+            btn.click(force=True)
             print("✅ Publish clicked")
             return True
         except Exception as e:
@@ -179,22 +184,35 @@ class InstagramUploader:
     # ─────────────────────────────
 
     def upload_reels(self, file_path: str, caption: str) -> bool:
-        file_path = os.path.abspath(file_path)
         self.build_driver()
         try:
             self.page.goto(self.buffer_url)
             self.wait_page_ready()
+
+            # Debug screenshot
             self.page.screenshot(path="debug.png", full_page=True)
+
+            # 1. باز کردن composer
             self.click_insta_profile()
+
+            # 2. Reels
             self.click_reels()
+
+            # 3. Caption
             if caption:
                 self.write_caption(caption)
+
+            # 4. Upload
             self.upload_file(file_path)
             self.page.wait_for_timeout(5000)
+
             if not self.is_media_uploaded():
                 print("⚠️ upload maybe failed")
+
+            # 5. Publish Now
             self.send_type_now()
             self.click_publish()
+
             self.page.wait_for_timeout(10000)
             self.wait_for_modal_close()
             return True
@@ -202,8 +220,7 @@ class InstagramUploader:
             self.close_driver()
 
 
-# API
-
+# API function
 def upload_instagram_reels(file_path: str, caption: str,
                            profile_path: str, buffer_url: str) -> bool:
     uploader = InstagramUploader(profile_path, buffer_url)
