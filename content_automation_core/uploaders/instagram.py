@@ -1,264 +1,121 @@
 import os
-from pathlib import Path
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import time
-WAIT_MS = 25_000
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-class InstagramUploader:
+WAIT_SEC = 25
 
+class InstagramUploaderSelenium:
     def __init__(self, profile_path: str, buffer_url: str):
         self.profile_path = profile_path
         self.buffer_url = buffer_url
-        self.page = None
-        self.context = None
-        self._playwright = None
-
-    # ─────────────────────────────
-    # Driver
-    # ─────────────────────────────
+        self.driver = None
 
     def build_driver(self):
-        self._playwright = sync_playwright().start()
-        self.context = self._playwright.chromium.launch_persistent_context(
-            user_data_dir=self.profile_path,
-            channel="chrome",
-            headless=False,
-            no_viewport=True,
-            ignore_default_args=["--enable-automation"],
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-notifications",
-                "--start-maximized",
-                "--no-sandbox",
-            ],
-        )
-        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-        self.page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+        options = Options()
+        options.add_argument(f"user-data-dir={self.profile_path}")
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        self.driver = webdriver.Chrome(options=options)
 
     def close_driver(self):
-        try:
-            if self.context:
-                self.context.close()
-            if self._playwright:
-                self._playwright.stop()
-        except:
-            pass
+        if self.driver:
+            self.driver.quit()
+
+    def wait_for_element(self, by, selector, timeout=WAIT_SEC):
+        return WebDriverWait(self.driver, timeout).until(
+            EC.presence_of_element_located((by, selector))
+        )
+
+    def wait_for_clickable(self, by, selector, timeout=WAIT_SEC):
+        return WebDriverWait(self.driver, timeout).until(
+            EC.element_to_be_clickable((by, selector))
+        )
 
     # ─────────────────────────────
-    # Helpers
+    # Main Actions
     # ─────────────────────────────
-
-    def wait_page_ready(self):
-        self.page.wait_for_load_state("domcontentloaded", timeout=WAIT_MS)
-        self.page.wait_for_selector("body", timeout=WAIT_MS)
-
-    def _has_new_ui(self) -> bool:
-        try:
-            self.page.locator("button[aria-haspopup='menu']").first.wait_for(timeout=6000)
-            return True
-        except:
-            return False
-
-    # ─────────────────────────────
-    # Open Composer
-    # ─────────────────────────────
-
-    def click_insta_profile(self):
-        if self._has_new_ui():
-            print("🆕 New Buffer UI")
-            create_btn = self.page.locator("button[aria-haspopup='menu']").first
-            create_btn.wait_for(state="visible", timeout=WAIT_MS)
-            create_btn.click(force=True)
-
-            self.page.locator("[role='menu']").wait_for(timeout=WAIT_MS)
-            post_item = self.page.locator("[role='menuitem']").filter(
-                has_text="Post"
-            ).first
-            post_item.wait_for(state="visible", timeout=WAIT_MS)
-            post_item.click(force=True)
-        else:
-            print("🕹 Old Buffer UI (fallback)")
-            insta = self.page.locator("[data-channel='instagram']").first
-            if not insta.count():
-                insta = self.page.locator("text=Instagram").first
-            insta.wait_for(timeout=WAIT_MS)
-            insta.hover()
-            btn = self.page.locator("button:has-text('New')").first
-            btn.wait_for(timeout=WAIT_MS)
-            btn.click(force=True)
-
-    # ─────────────────────────────
-    # Actions
-    # ─────────────────────────────
-
-    def click_reels(self):
-        """Click Reels (new UI: radio input, old UI: button)"""
-        try:
-            reels_input = self.page.locator("input#reels[type='radio']").first
-            if reels_input.count():
-                reels_input.set_checked(True)  # ⚡ Fix
-                print("🎬 Reels selected (new UI)")
-                return True
-            reels_btn = self.page.locator("#reels, text=Reels").first
-            if reels_btn.count():
-                reels_btn.wait_for(timeout=WAIT_MS)
-                reels_btn.click(force=True)
-                print("🎬 Reels selected (old UI)")
-                return True
-            print("⚠️ Reels not found")
-            return False
-        except Exception as e:
-            print("⚠️ Reels click failed:", e)
-            return False
-
-    def write_caption(self, caption: str):
-        box = self.page.locator("[data-testid='composer-text-area'], [contenteditable='true']").first
-        box.wait_for(timeout=WAIT_MS)
-        box.click()
-        self.page.keyboard.press("Control+a")
-        self.page.keyboard.press("Delete")
-        self.page.keyboard.type(caption)
-
-    def upload_file(self, file_path: str):
-        file_input = self.page.locator("input[type='file']").first
-        if file_input.count():
-            file_input.set_input_files(os.path.abspath(file_path))
-            print("📁 File uploaded (new UI)")
-        else:
-            # fallback old UI
-            upload_btn = self.page.locator("button.publish_uploadButton_wX99J").first
-            if upload_btn.count():
-                upload_btn.click(force=True)
-                hidden_input = upload_btn.locator("input[type='file']").first
-                hidden_input.set_input_files(os.path.abspath(file_path))
-                print("📁 File uploaded (old UI)")
-
-    def is_media_uploaded(self):
-        try:
-            self.page.locator("[data-testid='media-attachment-thumbnail']").wait_for(timeout=30000)
-            return True
-        except:
-            return False
-
-    def send_type_now(self):
-        """Select 'Now' for publishing (handle both UIs)"""
-        try:
-            # Open schedule dropdown
-            schedule_btn = self.page.locator("[data-testid='schedule-selector-trigger'], button[data-schedule-trigger='true']").first
-            schedule_btn.wait_for(timeout=WAIT_MS)
-            schedule_btn.click(force=True)
-
-            # Select Now
-            now_item = self.page.locator("div[role='menuitem']:has-text('Now')").first
-            now_item.wait_for(timeout=WAIT_MS)
-            now_item.click(force=True)
-            print("⏱ Publish set to Now")
-            return True
-        except Exception as e:
-            print("⚠️ schedule 'Now' not found:", e)
-            return False
-
-    # def click_publish(self):
-    #     """Click Publish button (handle both UIs)"""
-    #     try:
-    #         btn = self.page.locator("button:has-text('Publish'), button.publish_schedulePostButton_8XRSX").first
-    #         btn.wait_for(timeout=WAIT_MS)
-    #         btn.click(force=True)
-    #         print("✅ Publish clicked")
-            
-    #         self.page.wait_for_timeout(30000)  # اضافی: 5 ثانیه buffer
-    #         return True
-    #     except Exception as e:
-    #         print("⚠️ Publish button not found:", e)
-    #         return False
-    def click_publish(self):
-        """Click Publish button (handle both old and new Buffer UIs)"""
-        try:
-            # پیدا کردن دکمه Publish
-            btn = self.page.locator(
-                "button.publish_schedulePostButton_8XRSX, button:has-text('Publish')"
-            ).first
-
-            # scroll به دکمه تا در viewport باشد
-            btn.scroll_into_view_if_needed(timeout=15000)
-
-            # منتظر visible شدن دکمه
-            btn.wait_for(state="visible", timeout=15000)
-            time.sleep(3)
-            # کلیک force (در صورتی که overlay جلوی دکمه باشد)
-            btn.click(force=True)
-            print("✅ Publish clicked")
-
-            # صبر واقعی برای انتشار: حداقل 30 ثانیه
-            self.page.wait_for_timeout(30000)
-
-            # صبر برای بسته شدن modal بعد از انتشار
-            try:
-                self.page.locator("[role='dialog']").wait_for(state="hidden", timeout=35000)
-                print("✅ Post published and modal closed")
-            except:
-                print("⚠️ Modal did not close, publish may have issues")
-
-            # buffer safety اضافی
-            self.page.wait_for_timeout(5000)
-
-            return True
-
-        except Exception as e:
-            print("⚠️ Publish button not found or click failed:", e)
-            return False
-    def wait_for_modal_close(self):
-        try:
-            self.page.locator("[role='dialog']").wait_for(state="hidden", timeout=20000)
-            return True
-        except:
-            return False
-
-    # ─────────────────────────────
-    # Main
-    # ─────────────────────────────
-
     def upload_reels(self, file_path: str, caption: str) -> bool:
+        file_path = os.path.abspath(file_path)
         self.build_driver()
+
         try:
-            self.page.goto(self.buffer_url)
-            self.wait_page_ready()
+            self.driver.get(self.buffer_url)
+            time.sleep(5)  # give page some time to load
 
-            # Debug screenshot
-            self.page.screenshot(path="debug.png", full_page=True)
+            # Click on Instagram post creation
+            try:
+                create_btn = self.wait_for_clickable(By.CSS_SELECTOR, "button[aria-haspopup='menu']")
+                create_btn.click()
+                time.sleep(1)
+                post_item = self.wait_for_clickable(By.XPATH, "//div[@role='menuitem' and contains(., 'Post')]")
+                post_item.click()
+            except:
+                print("🕹 Old UI fallback")
+                insta_btn = self.wait_for_clickable(By.CSS_SELECTOR, "[data-channel='instagram']")
+                insta_btn.click()
+                new_post_btn = self.wait_for_clickable(By.XPATH, "//button[contains(., 'New')]")
+                new_post_btn.click()
 
-            # 1. باز کردن composer
-            self.click_insta_profile()
+            time.sleep(2)
 
-            # 2. Reels
-            self.click_reels()
+            # Click Reels (new UI)
+            try:
+                reels_label = self.wait_for_clickable(By.CSS_SELECTOR, "label[for='reels']")
+                reels_label.click()
+                print("✅ Reels clicked")
+            except:
+                print("⚠️ Reels click failed")
 
-            # 3. Caption
+            # Upload file
+            try:
+                upload_input = self.driver.find_element(By.CSS_SELECTOR, "input[type='file']")
+                upload_input.send_keys(file_path)
+                print("📁 File uploaded")
+            except:
+                print("⚠️ File upload failed")
+
+            time.sleep(2)
+
+            # Write caption
             if caption:
-                self.write_caption(caption)
+                try:
+                    caption_box = self.wait_for_element(By.CSS_SELECTOR, "[data-testid='composer-text-area'], [contenteditable='true']")
+                    caption_box.click()
+                    caption_box.clear()
+                    caption_box.send_keys(caption)
+                except:
+                    print("⚠️ Caption write failed")
 
-            # 4. Upload
-            self.upload_file(file_path)
-            self.page.wait_for_timeout(5000)
+            # Click Now (schedule)
+            try:
+                now_option = self.wait_for_clickable(By.XPATH, "//p[text()='Now']")
+                now_option.click()
+                print("⏱ Publish set to Now")
+            except:
+                print("⚠️ Now click failed")
 
-            if not self.is_media_uploaded():
-                print("⚠️ upload maybe failed")
+            # Click Publish (force via JS)
+            try:
+                publish_btn = self.wait_for_element(By.CSS_SELECTOR, "button.publish_schedulePostButton_8XRSX")
+                self.driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", publish_btn)
+                print("✅ Publish clicked")
+                time.sleep(30)  # wait for modal to close
+            except Exception as e:
+                print("⚠️ Publish click failed:", e)
+                return False
 
-            # 5. Publish Now
-            self.send_type_now()
-            self.click_publish()
-
-            self.page.wait_for_timeout(10000)
-            self.wait_for_modal_close()
             return True
+
         finally:
             self.close_driver()
 
 
-# API function
-def upload_instagram_reels(file_path: str, caption: str,
-                           profile_path: str, buffer_url: str) -> bool:
-    uploader = InstagramUploader(profile_path, buffer_url)
+# Usage
+def upload_instagram_reels(file_path: str, caption: str, profile_path: str, buffer_url: str):
+    uploader = InstagramUploaderSelenium(profile_path, buffer_url)
     return uploader.upload_reels(file_path, caption)
