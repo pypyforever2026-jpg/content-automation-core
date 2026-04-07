@@ -8,7 +8,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 WAIT_SEC = 25
 
-class InstagramUploaderSelenium:
+class InstagramUploader:
     def __init__(self, profile_path: str, buffer_url: str):
         self.profile_path = profile_path
         self.buffer_url = buffer_url
@@ -117,5 +117,5 @@ class InstagramUploaderSelenium:
 
 # Usage
 def upload_instagram_reels(file_path: str, caption: str, profile_path: str, buffer_url: str):
-    uploader = InstagramUploaderSelenium(profile_path, buffer_url)
+    uploader = InstagramUploader(profile_path, buffer_url)
     return uploader.upload_reels(file_path, caption)
