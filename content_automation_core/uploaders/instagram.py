@@ -8,6 +8,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 WAIT_SEC = 25
 
+
 class InstagramUploader:
     def __init__(self, profile_path: str, buffer_url: str):
         self.profile_path = profile_path
@@ -36,6 +37,10 @@ class InstagramUploader:
             EC.element_to_be_clickable((by, selector))
         )
 
+    def js_click(self, element):
+        """کلیک با JavaScript برای عناصری که با click() عادی کار نمی‌کنند"""
+        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", element)
+
     # ─────────────────────────────
     # Main Actions
     # ─────────────────────────────
@@ -47,14 +52,17 @@ class InstagramUploader:
             self.driver.get(self.buffer_url)
             time.sleep(5)  # give page some time to load
 
-            # Click on Instagram post creation
+            # ❶ باز کردن composer
             try:
                 create_btn = self.wait_for_clickable(By.CSS_SELECTOR, "button[aria-haspopup='menu']")
                 create_btn.click()
                 time.sleep(1)
-                post_item = self.wait_for_clickable(By.XPATH, "//div[@role='menuitem' and contains(., 'Post')]")
+                post_item = self.wait_for_clickable(
+                    By.XPATH, "//div[@role='menuitem' and contains(., 'Post')]"
+                )
                 post_item.click()
-            except:
+                print("✅ New UI: Create new → Post")
+            except Exception:
                 print("🕹 Old UI fallback")
                 insta_btn = self.wait_for_clickable(By.CSS_SELECTOR, "[data-channel='instagram']")
                 insta_btn.click()
@@ -63,57 +71,89 @@ class InstagramUploader:
 
             time.sleep(2)
 
-            # Click Reels (new UI)
+            # ❷ انتخاب Reels
             try:
                 reels_label = self.wait_for_clickable(By.CSS_SELECTOR, "label[for='reels']")
                 reels_label.click()
                 print("✅ Reels clicked")
-            except:
+            except Exception:
                 print("⚠️ Reels click failed")
 
-            # Upload file
+            # ❸ آپلود فایل
             try:
                 upload_input = self.driver.find_element(By.CSS_SELECTOR, "input[type='file']")
                 upload_input.send_keys(file_path)
                 print("📁 File uploaded")
-            except:
+                time.sleep(3)
+            except Exception:
                 print("⚠️ File upload failed")
 
-            time.sleep(2)
-
-            # Write caption
+            # ❹ نوشتن کپشن
             if caption:
                 try:
-                    caption_box = self.wait_for_element(By.CSS_SELECTOR, "[data-testid='composer-text-area'], [contenteditable='true']")
+                    caption_box = self.wait_for_element(
+                        By.CSS_SELECTOR,
+                        "[data-testid='composer-text-area'], [contenteditable='true']"
+                    )
                     caption_box.click()
-                    caption_box.clear()
+                    self.driver.execute_script("arguments[0].innerText = '';", caption_box)
                     caption_box.send_keys(caption)
-                except:
+                    print("✅ Caption written")
+                except Exception:
                     print("⚠️ Caption write failed")
 
-            # Click Now (schedule)
-            # Click Now (schedule) with JS
+            # ❺ باز کردن منوی Schedule و انتخاب «Now»
             try:
-                schedule_btn = self.wait_for_clickable(By.CSS_SELECTOR, "button[data-schedule-trigger='true']")
-                self.driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", schedule_btn)
+                # کلیک دکمه trigger
+                schedule_btn = self.wait_for_clickable(
+                    By.CSS_SELECTOR, "button[data-testid='schedule-selector-trigger']"
+                )
+                self.js_click(schedule_btn)
                 print("✅ Schedule menu opened")
-                time.sleep(3)
 
-                now_option = self.driver.find_element(By.XPATH, "//p[text()='Now']")
-                self.driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", now_option)
+                # ────────────────────────────────────────────────
+                # FIX: کلیک روی div[role='menuitem'] که شامل «Now» است
+                # نه فقط روی <p> که رویداد را trigger نمی‌کند
+                # ────────────────────────────────────────────────
+                now_menuitem = self.wait_for_clickable(
+                    By.XPATH,
+                    "//div[@role='menuitem'][.//p[normalize-space(text())='Now']]",
+                    timeout=10
+                )
+                self.js_click(now_menuitem)
                 print("⏱ Publish set to Now")
                 time.sleep(1)
-            except Exception as e:
-                print("⚠️ Now click skipped (JS forced it anyway)")
 
-            # Click Publish
-            try:
-                publish_btn = self.wait_for_clickable(By.CSS_SELECTOR, "button.publish_schedulePostButton_8XRSX")
-                self.driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", publish_btn)
-                print("✅ Publish clicked")
-                time.sleep(30)  # wait for modal to close
             except Exception as e:
-                print("⚠️ Publish click failed:", e)
+                print(f"⚠️ Schedule/Now click failed: {e}")
+
+            # ❻ کلیک Publish
+            try:
+                # سعی می‌کنیم چند selector مختلف برای Publish امتحان کنیم
+                publish_btn = None
+                publish_selectors = [
+                    (By.XPATH, "//button[normalize-space(text())='Share Now']"),
+                    (By.XPATH, "//button[normalize-space(text())='Publish Now']"),
+                    (By.XPATH, "//button[contains(@class,'schedulePostButton')]"),
+                    (By.CSS_SELECTOR, "button[data-testid='publish-button']"),
+                ]
+                for by, sel in publish_selectors:
+                    try:
+                        publish_btn = self.wait_for_clickable(by, sel, timeout=5)
+                        break
+                    except Exception:
+                        continue
+
+                if publish_btn:
+                    self.js_click(publish_btn)
+                    print("✅ Publish clicked")
+                    time.sleep(30)  # صبر برای بسته شدن modal
+                else:
+                    print("⚠️ Publish button not found")
+                    return False
+
+            except Exception as e:
+                print(f"⚠️ Publish click failed: {e}")
                 return False
 
             return True
@@ -122,7 +162,9 @@ class InstagramUploader:
             self.close_driver()
 
 
-# Usage
-def upload_instagram_reels(file_path: str, caption: str, profile_path: str, buffer_url: str):
+# ─────────────────────────────
+# Functional API
+# ─────────────────────────────
+def upload_instagram_reels(file_path: str, caption: str, profile_path: str, buffer_url: str) -> bool:
     uploader = InstagramUploader(profile_path, buffer_url)
     return uploader.upload_reels(file_path, caption)
