@@ -104,23 +104,38 @@ class InstagramUploader:
 
             # ❺ باز کردن منوی Schedule و انتخاب «Now»
             try:
-                # کلیک دکمه trigger
+                # ── مرحله ۱: کلیک واقعی روی trigger (نه JS — Radix UI به event واقعی نیاز دارد)
                 schedule_btn = self.wait_for_clickable(
                     By.CSS_SELECTOR, "button[data-testid='schedule-selector-trigger']"
                 )
-                self.js_click(schedule_btn)
-                print("✅ Schedule menu opened")
+                schedule_btn.click()
+                print("🖱 Schedule button clicked")
 
-                # ────────────────────────────────────────────────
-                # FIX: کلیک روی div[role='menuitem'] که شامل «Now» است
-                # نه فقط روی <p> که رویداد را trigger نمی‌کند
-                # ────────────────────────────────────────────────
-                now_menuitem = self.wait_for_clickable(
-                    By.XPATH,
-                    "//div[@role='menuitem'][.//p[normalize-space(text())='Now']]",
-                    timeout=10
+                # ── مرحله ۲: صبر تا منو واقعاً باز بشه (aria-expanded=true)
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((
+                        By.CSS_SELECTOR,
+                        "button[data-testid='schedule-selector-trigger'][aria-expanded='true']"
+                    ))
                 )
-                self.js_click(now_menuitem)
+                print("✅ Schedule menu confirmed open")
+
+                # ── مرحله ۳: صبر اضافی برای render شدن آیتم‌ها توسط React
+                time.sleep(2)
+
+                # ── مرحله ۴: پیدا کردن div[role='menuitem'] که شامل «Now» است
+                # (نه <p> — چون کلیک روی <p> رویداد menuitem را trigger نمی‌کند)
+                now_menuitem = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((
+                        By.XPATH,
+                        "//div[@role='menuitem'][.//p[normalize-space(text())='Now']]"
+                    ))
+                )
+                # کلیک واقعی اول، اگر نشد JS fallback
+                try:
+                    now_menuitem.click()
+                except Exception:
+                    self.driver.execute_script("arguments[0].click();", now_menuitem)
                 print("⏱ Publish set to Now")
                 time.sleep(1)
 
@@ -161,7 +176,7 @@ class InstagramUploader:
         finally:
             self.close_driver()
 
-#nwq
+
 # ─────────────────────────────
 # Functional API
 # ─────────────────────────────
