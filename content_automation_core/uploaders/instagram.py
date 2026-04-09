@@ -41,6 +41,26 @@ class InstagramUploader:
         """کلیک با JavaScript برای عناصری که با click() عادی کار نمی‌کنند"""
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", element)
 
+    def navigate_to(self, url: str, retries: int = 3, wait_sec: int = 8) -> bool:
+        """
+        Navigate به URL با retry — حل مشکل ماندن روی home page.
+        بعد از هر get() بررسی می‌کند آیا URL عوض شده؛ اگر نه دوباره تلاش می‌کند.
+        """
+        expected_fragment = url.split("buffer.com")[-1]  # مثلاً /channels/abc123
+        for attempt in range(1, retries + 1):
+            print(f"🔗 Navigating to Buffer (attempt {attempt}/{retries})...")
+            self.driver.get(url)
+            time.sleep(wait_sec)
+            current = self.driver.current_url
+            if expected_fragment and expected_fragment in current:
+                print(f"✅ Navigation successful: {current}")
+                return True
+            # اگه هنوز روی صفحه اشتباه هست، یه بار صبر اضافی
+            print(f"⚠️ Still on wrong page: {current} — retrying...")
+            time.sleep(3)
+        print(f"❌ Failed to navigate to {url} after {retries} attempts")
+        return False
+
     # ─────────────────────────────
     # Main Actions
     # ─────────────────────────────
@@ -49,8 +69,9 @@ class InstagramUploader:
         self.build_driver()
 
         try:
-            self.driver.get(self.buffer_url)
-            time.sleep(5)  # give page some time to load
+            if not self.navigate_to(self.buffer_url):
+                print("❌ Could not reach Buffer URL — aborting")
+                return False
 
             # ❶ باز کردن composer
             try:
