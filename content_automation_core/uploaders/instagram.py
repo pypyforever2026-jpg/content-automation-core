@@ -114,14 +114,27 @@ class InstagramUploader:
                 try:
                     caption_box = self.wait_for_element(
                         By.CSS_SELECTOR,
-                        "[data-testid='composer-text-area'], [contenteditable='true']"
+                        "[data-testid='composer-text-area']"
                     )
+                    
                     caption_box.click()
-                    self.driver.execute_script("arguments[0].innerText = '';", caption_box)
-                    caption_box.send_keys(caption)
-                    print("✅ Caption written")
-                except Exception:
-                    print("⚠️ Caption write failed")
+                    time.sleep(0.5)
+
+                    self.driver.execute_script("""
+                    const el = arguments[0];
+                    const text = arguments[1];
+
+                    el.focus();
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('delete', false, null);
+                    document.execCommand('insertText', false, text);
+
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    """, caption_box, caption)
+
+                    print("✅ Caption written (React-safe)")
+                except Exception as e:
+                    print(f"⚠️ Caption write failed: {e}")
 
             # ❺ باز کردن منوی Schedule و انتخاب «Now»
             try:
