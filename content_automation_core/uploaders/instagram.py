@@ -1,10 +1,31 @@
 import os
 import time
+import subprocess
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+
+
+def _set_clipboard_windows(text: str) -> bool:
+    """
+    متن را روی clipboard ویندوز مینویسد.
+    از clip.exe داخلی ویندوز استفاده میکند — بدون ctypes، بدون pip.
+    BOM اضافه میکند تا clip.exe متن را Unicode بخواند (برای فارسی ضروری است).
+    """
+    try:
+        bom = b"\xff\xfe"  # UTF-16 LE BOM
+        encoded = bom + text.encode("utf-16-le")
+        proc = subprocess.Popen("clip", stdin=subprocess.PIPE, shell=True)
+        proc.communicate(input=encoded)
+        return proc.returncode == 0
+    except Exception as e:
+        print(f"⚠️ clip.exe failed: {e}")
+        return False
+
 
 WAIT_SEC = 25
 
@@ -38,13 +59,13 @@ class InstagramUploader:
         )
 
     def js_click(self, element):
-        """کلیک با JavaScript برای عناصری که با click() عادی کار نمی‌کنند"""
+        """کلیک با JavaScript برای عناصری که با click() عادی کار نمیکنند"""
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", element)
 
     def navigate_to(self, url: str, retries: int = 3, wait_sec: int = 8) -> bool:
         """
         Navigate به URL با retry — حل مشکل ماندن روی home page.
-        بعد از هر get() بررسی می‌کند آیا URL عوض شده؛ اگر نه دوباره تلاش می‌کند.
+        بعد از هر get() بررسی میکند آیا URL عوض شده؛ اگر نه دوباره تلاش میکند.
         """
         expected_fragment = url.split("buffer.com")[-1]  # مثلاً /channels/abc123
         for attempt in range(1, retries + 1):
@@ -112,29 +133,55 @@ class InstagramUploader:
             # ❹ نوشتن کپشن
             if caption:
                 try:
-                    caption_box = self.wait_for_element(
-                        By.CSS_SELECTOR,
-                        "[data-testid='composer-text-area']"
-                    )
-                    
-                    caption_box.click()
-                    time.sleep(0.5)
+                    # چند selector مختلف امتحان میکنیم (Buffer UI ممکنه تغییر کنه)
+                    caption_selectors = [
+                        "[data-testid='composer-text-area']",
+                        ".public-DraftEditor-content",
+                        "div[contenteditable='true']",
+                        "div[role='textbox']",
+                    ]
+                    caption_box = None
+                    for sel in caption_selectors:
+                        try:
+                            caption_box = WebDriverWait(self.driver, 8).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                            )
+                            print(f"✅ Caption box found via: {sel}")
+                            break
+                        except Exception:
+                            continue
 
-                    self.driver.execute_script("""
-                    const el = arguments[0];
-                    const text = arguments[1];
+                    if caption_box is None:
+                        print("⚠️ Caption box not found — skipping caption")
+                    else:
+                        # ── کلیک برای فوکوس ──
+                        caption_box.click()
+                        time.sleep(0.4)
 
-                    el.focus();
-                    document.execCommand('selectAll', false, null);
-                    document.execCommand('delete', false, null);
-                    document.execCommand('insertText', false, text);
+                        # ── Ctrl+A برای پاک کردن محتوای قبلی ──
+                        actions = ActionChains(self.driver)
+                        actions.key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
+                        time.sleep(0.2)
 
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    """, caption_box, caption)
+                        # ── استراتژی ۱: clipboard + Ctrl+V ──
+                        clip_ok = _set_clipboard_windows(caption)
+                        time.sleep(0.4)  # صبر تا clip.exe تمام کند
 
-                    print("✅ Caption written (React-safe)")
+                        if clip_ok:
+                            actions2 = ActionChains(self.driver)
+                            actions2.key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+                            time.sleep(0.5)
+                            print("✅ Caption pasted via clipboard (Ctrl+V)")
+                        else:
+                            # ── استراتژی ۲: send_keys مستقیم (fallback) ──
+                            print("⚠️ Clipboard failed — falling back to send_keys")
+                            caption_box.send_keys(caption)
+                            time.sleep(0.5)
+                            print("✅ Caption written via send_keys")
+
                 except Exception as e:
                     print(f"⚠️ Caption write failed: {e}")
+
 
             # ❺ باز کردن منوی Schedule و انتخاب «Now»
             try:
@@ -154,11 +201,10 @@ class InstagramUploader:
                 )
                 print("✅ Schedule menu confirmed open")
 
-                # ── مرحله ۳: صبر اضافی برای render شدن آیتم‌ها توسط React
+                # ── مرحله ۳: صبر اضافی برای render شدن آیتمها توسط React
                 time.sleep(2)
 
                 # ── مرحله ۴: پیدا کردن div[role='menuitem'] که شامل «Now» است
-                # (نه <p> — چون کلیک روی <p> رویداد menuitem را trigger نمی‌کند)
                 now_menuitem = WebDriverWait(self.driver, 10).until(
                     EC.presence_of_element_located((
                         By.XPATH,
@@ -178,7 +224,6 @@ class InstagramUploader:
 
             # ❻ کلیک Publish
             try:
-                # سعی می‌کنیم چند selector مختلف برای Publish امتحان کنیم
                 publish_btn = None
                 publish_selectors = [
                     (By.XPATH, "//button[normalize-space(text())='Share Now']"),
