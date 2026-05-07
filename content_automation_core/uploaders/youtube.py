@@ -551,14 +551,20 @@ class YouTubeUploader:
                 self.logger.error("Could not find Save/Publish button")
                 return False
 
+            # Brief pause so the prechecks dialog (if any) starts rendering
+            time.sleep(3)
+
+            # Handle "We're still checking your content" warning if it appears
+            self._handle_prechecks_warning()
+
             # Wait for completion
-            time.sleep(20)
+            time.sleep(15)
 
             # Check for any confirmation or success messages
             try:
                 success_indicators = [
                     "//*[contains(text(), 'Video published')]",
-                    "//*[contains(text(), 'Video saved')]", 
+                    "//*[contains(text(), 'Video saved')]",
                     "//*[contains(text(), 'Upload complete')]",
                     "//*[contains(text(), 'Processing')]"
                 ]
@@ -577,9 +583,117 @@ class YouTubeUploader:
 
             return True
 
-        except Exception as e:        
+        except Exception as e:
             self.logger.error(f"Failed to set visibility and save: {e}")
             return False
+
+    def _handle_prechecks_warning(self, max_wait_sec: int = 12) -> bool:
+        """
+        Handle YouTube's "We're still checking your content" warning dialog
+        (ytcp-prechecks-warning-dialog) by clicking the "Publish anyway" button
+        when it appears.
+
+        This dialog appears intermittently on certain channels right after the
+        Publish click and blocks the actual publish unless dismissed.
+
+        Args:
+            max_wait_sec: how long to wait for the dialog to appear at most.
+
+        Returns:
+            bool: True if the dialog was found AND "Publish anyway" was clicked,
+                  False otherwise (also returns False if the dialog never appeared,
+                  which is the normal happy path).
+        """
+        # Selectors that indicate the prechecks warning dialog is open.
+        dialog_selectors = [
+            "//ytcp-prechecks-warning-dialog",
+            "//*[@id='dialog-title' and contains(., \"still checking your content\")]",
+            "//h1[contains(@class, 'ytcp-prechecks-warning-dialog')]",
+        ]
+
+        dialog_found = False
+        end_time = time.time() + max_wait_sec
+        while time.time() < end_time:
+            for sel in dialog_selectors:
+                try:
+                    el = self.driver.find_element(By.XPATH, sel)
+                    if el and el.is_displayed():
+                        dialog_found = True
+                        break
+                except Exception:
+                    continue
+            if dialog_found:
+                break
+            time.sleep(0.5)
+
+        if not dialog_found:
+            self.logger.info("No prechecks warning dialog detected (normal case).")
+            return False
+
+        self.logger.warning("Prechecks warning dialog detected. Clicking 'Publish anyway'...")
+
+        # Selectors for the "Publish anyway" button, ordered most-specific first.
+        publish_anyway_selectors = [
+            "//ytcp-prechecks-warning-dialog//button[@aria-label='Publish anyway']",
+            "//button[@aria-label='Publish anyway']",
+            "//ytcp-prechecks-warning-dialog//*[normalize-space(text())='Publish anyway']/ancestor::button",
+            "//*[normalize-space(text())='Publish anyway']/ancestor::button",
+            "//ytcp-button[@aria-label='Publish anyway']",
+            "//ytcp-button[contains(., 'Publish anyway')]",
+        ]
+
+        for selector in publish_anyway_selectors:
+            try:
+                btn = WebDriverWait(self.driver, 8).until(
+                    EC.element_to_be_clickable((By.XPATH, selector))
+                )
+                try:
+                    self.driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});", btn
+                    )
+                except Exception:
+                    pass
+                time.sleep(0.4)
+                try:
+                    btn.click()
+                except Exception:
+                    self.driver.execute_script("arguments[0].click();", btn)
+
+                self.logger.info("Clicked 'Publish anyway' on prechecks warning dialog.")
+                # Give YouTube a moment to actually submit the publish.
+                time.sleep(3)
+                return True
+            except TimeoutException:
+                continue
+            except Exception as e:
+                self.logger.debug(f"Publish anyway selector failed: {selector}, Error: {e}")
+                continue
+
+        # Last-resort JS scan over all buttons in the dialog
+        try:
+            clicked = self.driver.execute_script("""
+                var dialog = document.querySelector('ytcp-prechecks-warning-dialog');
+                var scope = dialog || document;
+                var buttons = scope.querySelectorAll('button');
+                for (var i = 0; i < buttons.length; i++) {
+                    var label = buttons[i].getAttribute('aria-label') || '';
+                    var text = (buttons[i].innerText || buttons[i].textContent || '').trim();
+                    if (label === 'Publish anyway' || text === 'Publish anyway') {
+                        buttons[i].click();
+                        return true;
+                    }
+                }
+                return false;
+            """)
+            if clicked:
+                self.logger.info("Clicked 'Publish anyway' via JS fallback.")
+                time.sleep(3)
+                return True
+        except Exception as e:
+            self.logger.debug(f"JS fallback for Publish anyway failed: {e}")
+
+        self.logger.error("Prechecks dialog was open but 'Publish anyway' could not be clicked.")
+        return False
 
     def close(self):
         """Close the browser"""

@@ -62,55 +62,207 @@ class InstagramUploader:
         """کلیک با JavaScript برای عناصری که با click() عادی کار نمیکنند"""
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", element)
 
-    def navigate_to(self, url: str, retries: int = 3, wait_sec: int = 8) -> bool:
+    def _is_login_page(self, current_url: str) -> bool:
+        """تشخیص ریدایرکت به صفحه login بافر/گوگل."""
+        if not current_url:
+            return False
+        login_markers = (
+            "login.buffer.com",
+            "account.buffer.com",
+            "/login",
+            "accounts.google.com",
+            "signin",
+        )
+        url_lc = current_url.lower()
+        return any(marker in url_lc for marker in login_markers)
+
+    def _wait_for_buffer_ready(self, timeout: int = 25) -> bool:
         """
-        Navigate به URL با retry — حل مشکل ماندن روی home page.
-        بعد از هر get() بررسی میکند آیا URL عوض شده؛ اگر نه دوباره تلاش میکند.
+        منتظر می‌مانیم تا shell بافر واقعاً لود شود (دکمه Create یا منوی sidebar).
+        صرفِ تغییر URL کافی نیست؛ خیلی وقت‌ها URL درست است ولی صفحه هنوز سفید است.
         """
-        expected_fragment = url.split("buffer.com")[-1]  # مثلاً /channels/abc123
+        ready_selectors = [
+            (By.CSS_SELECTOR, "button[aria-haspopup='menu']"),
+            (By.CSS_SELECTOR, "[data-channel='instagram']"),
+            (By.XPATH, "//button[contains(., 'Create')]"),
+            (By.XPATH, "//button[contains(., 'New Post')]"),
+        ]
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            for by, sel in ready_selectors:
+                try:
+                    el = self.driver.find_element(by, sel)
+                    if el.is_displayed():
+                        return True
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        return False
+
+    def navigate_to(self, url: str, retries: int = 4, wait_sec: int = 10) -> bool:
+        """
+        Navigate به URL با retry قوی.
+
+        بهبودها نسبت به نسخه قبل:
+        - علاوه بر URL، منتظر یک عنصر واقعی Buffer می‌ماند (نه فقط URL).
+        - در صورت ریدایرکت به login، فوراً متوقف می‌شود و خطای واضح می‌دهد
+          (دیگر بی‌نهایت تلاش بیخود نمی‌کند).
+        - بین تلاش‌ها یک‌بار refresh هم انجام می‌دهد.
+        - expected_fragment فقط وقتی استفاده می‌شود که URL واقعاً buffer.com باشد.
+        """
+        if "buffer.com" in url:
+            expected_fragment = url.split("buffer.com", 1)[-1].rstrip("/")
+        else:
+            expected_fragment = ""
+
         for attempt in range(1, retries + 1):
             print(f"🔗 Navigating to Buffer (attempt {attempt}/{retries})...")
-            self.driver.get(url)
+            try:
+                self.driver.get(url)
+            except Exception as e:
+                print(f"⚠️ driver.get failed: {e}")
+                time.sleep(3)
+                continue
+
             time.sleep(wait_sec)
-            current = self.driver.current_url
-            if expected_fragment and expected_fragment in current:
+            current = self.driver.current_url or ""
+
+            # 1) ریدایرکت به login → بدون login نمی‌شود ادامه داد، fail سریع.
+            if self._is_login_page(current):
+                print(
+                    "❌ Redirected to login page — Chrome profile is not authenticated to Buffer. "
+                    f"current_url={current}"
+                )
+                return False
+
+            # 2) بررسی URL (در صورت داشتن fragment معتبر)
+            url_ok = (not expected_fragment) or (expected_fragment in current)
+
+            # 3) بررسی واقعی بودن صفحه (عنصر Create موجود است؟)
+            page_ready = self._wait_for_buffer_ready(timeout=12)
+
+            if url_ok and page_ready:
                 print(f"✅ Navigation successful: {current}")
                 return True
-            # اگه هنوز روی صفحه اشتباه هست، یه بار صبر اضافی
-            print(f"⚠️ Still on wrong page: {current} — retrying...")
+
+            print(
+                f"⚠️ Navigation not confirmed yet (url_ok={url_ok}, page_ready={page_ready}, "
+                f"current={current}) — retrying..."
+            )
+
+            # تلاش وسطی: یک‌بار refresh قبل از get مجدد
+            try:
+                self.driver.refresh()
+                time.sleep(wait_sec)
+                current = self.driver.current_url or ""
+                if self._is_login_page(current):
+                    print(f"❌ After refresh: redirected to login → {current}")
+                    return False
+                url_ok = (not expected_fragment) or (expected_fragment in current)
+                page_ready = self._wait_for_buffer_ready(timeout=10)
+                if url_ok and page_ready:
+                    print(f"✅ Navigation successful after refresh: {current}")
+                    return True
+            except Exception as e:
+                print(f"⚠️ refresh failed: {e}")
+
             time.sleep(3)
+
         print(f"❌ Failed to navigate to {url} after {retries} attempts")
         return False
 
     # ─────────────────────────────
+    # Composer
+    # ─────────────────────────────
+    def _open_composer(self) -> bool:
+        """
+        تلاش برای باز کردن composer (Create new → Post). دو مسیر UI جدید و قدیم
+        را امتحان می‌کند و True/False برمی‌گرداند تا فراخواننده بتواند retry کند.
+        """
+        # New UI
+        try:
+            create_btn = self.wait_for_clickable(
+                By.CSS_SELECTOR, "button[aria-haspopup='menu']", timeout=15
+            )
+            create_btn.click()
+            time.sleep(1)
+            post_item = self.wait_for_clickable(
+                By.XPATH, "//div[@role='menuitem' and contains(., 'Post')]", timeout=10
+            )
+            post_item.click()
+            print("✅ New UI: Create new → Post")
+            return True
+        except Exception as e:
+            print(f"🕹 New UI failed ({e}) — trying old UI fallback")
+
+        # Old UI fallback
+        try:
+            insta_btn = self.wait_for_clickable(
+                By.CSS_SELECTOR, "[data-channel='instagram']", timeout=10
+            )
+            insta_btn.click()
+            new_post_btn = self.wait_for_clickable(
+                By.XPATH, "//button[contains(., 'New')]", timeout=10
+            )
+            new_post_btn.click()
+            print("✅ Old UI: Instagram → New")
+            return True
+        except Exception as e:
+            print(f"❌ Old UI fallback also failed: {e}")
+            return False
+
+    # ─────────────────────────────
     # Main Actions
     # ─────────────────────────────
-    def upload_reels(self, file_path: str, caption: str) -> bool:
-        file_path = os.path.abspath(file_path)
-        self.build_driver()
+    def upload_reels(self, file_path: str, caption: str, max_relaunch: int = 2) -> bool:
+        """
+        Upload یک Reel به Buffer.
 
-        try:
-            if not self.navigate_to(self.buffer_url):
-                print("❌ Could not reach Buffer URL — aborting")
+        max_relaunch: اگر navigate یا open_composer شکست بخورد، driver کاملاً
+        بسته و دوباره باز می‌شود (تا max_relaunch بار). این مهم‌ترین لایه‌ی
+        مقاومت در برابر باگ «به URL نمی‌رود» است.
+        """
+        file_path = os.path.abspath(file_path)
+
+        for relaunch_attempt in range(max_relaunch + 1):
+            self.build_driver()
+            try:
+                if not self.navigate_to(self.buffer_url):
+                    print(
+                        f"❌ Could not reach Buffer URL "
+                        f"(relaunch {relaunch_attempt}/{max_relaunch})"
+                    )
+                    self.close_driver()
+                    if relaunch_attempt < max_relaunch:
+                        print("🔄 Relaunching browser from scratch...")
+                        time.sleep(3)
+                        continue
+                    return False
+
+                if not self._open_composer():
+                    print(
+                        f"❌ Could not open composer "
+                        f"(relaunch {relaunch_attempt}/{max_relaunch})"
+                    )
+                    self.close_driver()
+                    if relaunch_attempt < max_relaunch:
+                        print("🔄 Relaunching browser from scratch...")
+                        time.sleep(3)
+                        continue
+                    return False
+
+                # navigate + composer هر دو اوکی → از حلقه‌ی relaunch خارج شو
+                break
+            except Exception as e:
+                print(f"⚠️ Unexpected error during navigate/composer: {e}")
+                self.close_driver()
+                if relaunch_attempt < max_relaunch:
+                    print("🔄 Relaunching browser from scratch...")
+                    time.sleep(3)
+                    continue
                 return False
 
-            # ❶ باز کردن composer
-            try:
-                create_btn = self.wait_for_clickable(By.CSS_SELECTOR, "button[aria-haspopup='menu']")
-                create_btn.click()
-                time.sleep(1)
-                post_item = self.wait_for_clickable(
-                    By.XPATH, "//div[@role='menuitem' and contains(., 'Post')]"
-                )
-                post_item.click()
-                print("✅ New UI: Create new → Post")
-            except Exception:
-                print("🕹 Old UI fallback")
-                insta_btn = self.wait_for_clickable(By.CSS_SELECTOR, "[data-channel='instagram']")
-                insta_btn.click()
-                new_post_btn = self.wait_for_clickable(By.XPATH, "//button[contains(., 'New')]")
-                new_post_btn.click()
-
+        try:
             time.sleep(2)
 
             # ❷ انتخاب Reels
@@ -121,14 +273,19 @@ class InstagramUploader:
             except Exception:
                 print("⚠️ Reels click failed")
 
-            # ❸ آپلود فایل
+            # ❸ آپلود فایل (با wait تا input واقعاً ظاهر بشود)
             try:
-                upload_input = self.driver.find_element(By.CSS_SELECTOR, "input[type='file']")
+                upload_input = WebDriverWait(self.driver, 20).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "input[type='file']")
+                    )
+                )
                 upload_input.send_keys(file_path)
                 print("📁 File uploaded")
                 time.sleep(3)
-            except Exception:
-                print("⚠️ File upload failed")
+            except Exception as e:
+                print(f"⚠️ File upload failed: {e}")
+                return False
 
             # ❹ نوشتن کپشن
             if caption:
@@ -238,22 +395,90 @@ class InstagramUploader:
                     except Exception:
                         continue
 
-                if publish_btn:
-                    self.js_click(publish_btn)
-                    print("✅ Publish clicked")
-                    time.sleep(30)  # صبر برای بسته شدن modal
-                else:
+                if not publish_btn:
                     print("⚠️ Publish button not found")
                     return False
+
+                self.js_click(publish_btn)
+                print("✅ Publish clicked — verifying...")
 
             except Exception as e:
                 print(f"⚠️ Publish click failed: {e}")
                 return False
 
-            return True
+            # ❼ تأیید واقعی publish — به جای sleep(30) خام، بسته شدن modal یا
+            # ظهور toast/state موفقیت را چک می‌کنیم.
+            return self._verify_publish_succeeded(timeout=60)
 
         finally:
             self.close_driver()
+
+    def _verify_publish_succeeded(self, timeout: int = 60) -> bool:
+        """
+        بعد از کلیک Publish، چک می‌کند که آیا ارسال واقعاً انجام شده یا نه.
+
+        موفقیت یعنی یکی از این‌ها:
+          - Modal/Composer بسته شده (دکمه publish دیگر در DOM نیست/visible نیست).
+          - Toast یا متنی شامل «Sharing now», «Post added», «posted», «scheduled» پیدا شد.
+
+        اگر هیچ‌کدام تو timeout اتفاق نیفتد False برمی‌گرداند تا تماس‌گیرنده
+        بفهمد publish انگار شکست خورده.
+        """
+        success_text_xpath = (
+            "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+            "'abcdefghijklmnopqrstuvwxyz'), 'sharing now') or "
+            "contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+            "'abcdefghijklmnopqrstuvwxyz'), 'post added') or "
+            "contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+            "'abcdefghijklmnopqrstuvwxyz'), 'has been posted') or "
+            "contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+            "'abcdefghijklmnopqrstuvwxyz'), 'successfully posted') or "
+            "contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+            "'abcdefghijklmnopqrstuvwxyz'), 'queued')]"
+        )
+
+        publish_btn_selectors = [
+            (By.XPATH, "//button[normalize-space(text())='Share Now']"),
+            (By.XPATH, "//button[normalize-space(text())='Publish Now']"),
+            (By.CSS_SELECTOR, "button[data-testid='publish-button']"),
+        ]
+
+        end_time = time.time() + timeout
+        last_log = 0.0
+        while time.time() < end_time:
+            # 1) دکمه Publish دیگر visible نیست → modal بسته شده
+            publish_visible = False
+            for by, sel in publish_btn_selectors:
+                try:
+                    el = self.driver.find_element(by, sel)
+                    if el.is_displayed():
+                        publish_visible = True
+                        break
+                except Exception:
+                    continue
+            if not publish_visible:
+                print("✅ Publish modal closed — upload confirmed")
+                # یک کم صبر می‌کنیم تا اگر toast هست هم لود شود
+                time.sleep(3)
+                return True
+
+            # 2) toast موفقیت ظاهر شد
+            try:
+                el = self.driver.find_element(By.XPATH, success_text_xpath)
+                if el.is_displayed():
+                    print(f"✅ Publish success toast detected: '{el.text[:80]}'")
+                    return True
+            except Exception:
+                pass
+
+            now = time.time()
+            if now - last_log > 5:
+                print("⏳ Waiting for Buffer to confirm publish...")
+                last_log = now
+            time.sleep(1)
+
+        print("❌ Publish click did not produce a confirmed success within timeout")
+        return False
 
 
 # ─────────────────────────────
