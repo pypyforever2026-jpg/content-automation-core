@@ -42,11 +42,39 @@ class InstagramUploader:
         options.add_argument("--start-maximized")
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        # ── Anti-lock / anti-dialog flags ────────────────────────────────────
+        # Without these, Chrome can:
+        #  (a) Show "Chrome didn't shut down correctly" bubble that blocks nav,
+        #  (b) Detect the profile lock from a previous quick-restart and fall
+        #      back to a guest/temp profile (no session → no cookies → stuck
+        #      on chrome://new-tab-page after every driver.get() call).
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-session-crashed-bubble")
+        options.add_argument("--disable-restore-session-state")
+        options.add_argument("--disable-infobars")
+        # ─────────────────────────────────────────────────────────────────────
         self.driver = webdriver.Chrome(options=options)
 
-    def close_driver(self):
+    def close_driver(self, lock_wait: int = 4):
+        """
+        Quit the browser and wait for Chrome to release its profile lock.
+
+        Chrome writes a ``SingletonLock`` file inside the profile directory.
+        If we create a new Chrome instance before the old process fully exits
+        and removes that file, the new instance opens without the profile
+        (guest mode, no session) and driver.get() leaves the browser on
+        chrome://new-tab-page.  A short sleep after quit() is the simplest
+        reliable fix.
+        """
         if self.driver:
-            self.driver.quit()
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            finally:
+                self.driver = None
+            time.sleep(lock_wait)  # give Chrome time to release SingletonLock
 
     def wait_for_element(self, by, selector, timeout=WAIT_SEC):
         return WebDriverWait(self.driver, timeout).until(
@@ -61,6 +89,57 @@ class InstagramUploader:
     def js_click(self, element):
         """کلیک با JavaScript برای عناصری که با click() عادی کار نمیکنند"""
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", element)
+
+    # ─────────────────────────────
+    # Browser State Helpers
+    # ─────────────────────────────
+
+    def _is_chrome_stuck(self) -> bool:
+        """
+        Return True when Chrome is on an internal/blank page instead of the
+        target site — meaning driver.get() had no effect.
+
+        This typically means:
+          - Chrome opened in guest mode due to profile lock (SingletonLock).
+          - A crash-recovery dialog blocked navigation.
+          - The WebDriver connection was re-established on an empty window.
+
+        Internal-page prefixes: chrome://, about:, data:, chrome-error://
+        """
+        try:
+            url = self.driver.current_url or ""
+        except Exception:
+            return True
+        return (
+            not url
+            or url.startswith(("chrome://", "about:", "data:", "chrome-error://"))
+        )
+
+    def _log_page_state(self, label: str = "") -> None:
+        """
+        Print a diagnostic snapshot: URL, page title, and first 250 chars of
+        body text. Use this after every navigation step to make root-cause
+        analysis straightforward when something goes wrong.
+        """
+        try:
+            url = self.driver.current_url or "N/A"
+        except Exception:
+            url = "ERROR reading url"
+        try:
+            title = self.driver.title or "(no title)"
+        except Exception:
+            title = "ERROR reading title"
+        try:
+            body_snippet = self.driver.execute_script(
+                "return (document.body ? document.body.innerText : '').substring(0, 250);"
+            ) or "(empty body)"
+        except Exception:
+            body_snippet = "ERROR reading body"
+
+        prefix = f"[{label}] " if label else ""
+        print(f"{prefix}URL   : {url}")
+        print(f"{prefix}TITLE : {title}")
+        print(f"{prefix}BODY  : {body_snippet!r}")
 
     def _is_login_page(self, current_url: str) -> bool:
         """تشخیص ریدایرکت به صفحه login بافر/گوگل."""
@@ -101,17 +180,25 @@ class InstagramUploader:
 
     def navigate_to(self, url: str, retries: int = 3, initial_wait: int = 5) -> bool:
         """
-        Navigate به URL با retry.
+        Navigate to url with thorough verification.
 
-        هر تلاش:
+        Each attempt:
           1. driver.get(url)
-          2. صبر initial_wait ثانیه تا redirect/session cookie اعمال شود
-          3. بررسی login redirect (fail fast)
-          4. _wait_for_buffer_ready با timeout=40s — React SPA بافر روی cold-browser
-             می‌تواند ۲۰-۳۰ ثانیه طول بکشد و باید صبر کافی داشته باشیم.
+          2. Wait initial_wait seconds for redirect to settle.
+          3. Log full page state (URL + title + body snippet) for diagnostics.
+          4. CRITICAL CHECK: if we're on a Chrome internal page (chrome://newtab,
+             about:blank, etc.), driver.get() had NO effect.  Root causes:
+               - Profile SingletonLock not yet released (profile in use by
+                 another Chrome process → guest mode, no session).
+               - Chrome crash-recovery dialog blocked navigation.
+             In this case we attempt a JS-level navigation fallback.
+             If that also fails, we continue to the next attempt.
+          5. Check for login redirect (Buffer session expired) → fail fast.
+          6. Wait up to 40s for the Buffer React shell to render.
+          7. Log final state and return True/False.
 
-        مهم: هیچ driver.refresh() بین تلاش‌ها نیست. refresh حین لود SPA
-        را interrupt می‌کند و باعث می‌شود همان چرخه تکرار شود.
+        No driver.refresh() is ever called inside this method — it would
+        interrupt React SPA hydration and guarantee repeated failures.
         """
         if "buffer.com" in url:
             expected_fragment = url.split("buffer.com", 1)[-1].rstrip("/")
@@ -119,49 +206,81 @@ class InstagramUploader:
             expected_fragment = ""
 
         for attempt in range(1, retries + 1):
-            print(f"🔗 Navigating to Buffer (attempt {attempt}/{retries})...")
+            print(f"🔗 Navigate attempt {attempt}/{retries} → {url}")
             try:
                 self.driver.get(url)
             except Exception as e:
-                print(f"⚠️ driver.get failed: {e}")
+                print(f"⚠️ driver.get() raised: {e}")
+                self._log_page_state(f"after failed get attempt {attempt}")
                 time.sleep(5)
                 continue
 
-            # کوچکترین صبر اولیه تا redirect کامل شود
             time.sleep(initial_wait)
+            self._log_page_state(f"after driver.get attempt {attempt}")
+
+            # ── CRITICAL: Chrome internal page detection ─────────────────
+            if self._is_chrome_stuck():
+                current = self.driver.current_url or ""
+                print(
+                    f"⚠️ Chrome is stuck on internal page: '{current}'\n"
+                    f"   Likely cause: profile SingletonLock still held by previous "
+                    f"Chrome process, or crash-recovery dialog.\n"
+                    f"   Attempting JS-level navigation fallback..."
+                )
+                try:
+                    self.driver.execute_script(
+                        "window.location.href = arguments[0];", url
+                    )
+                    time.sleep(initial_wait + 2)
+                    self._log_page_state(f"after JS navigate attempt {attempt}")
+                except Exception as js_e:
+                    print(f"⚠️ JS navigation also raised: {js_e}")
+
+                if self._is_chrome_stuck():
+                    print(
+                        f"❌ Still on Chrome internal page after JS fallback — "
+                        f"this attempt cannot proceed. Retrying..."
+                    )
+                    time.sleep(3)
+                    continue
+            # ─────────────────────────────────────────────────────────────
+
             current = self.driver.current_url or ""
 
-            # ریدایرکت به login → نشانه‌ی session منقضی شده
+            # Login redirect = session expired → no point retrying same URL
             if self._is_login_page(current):
                 print(
-                    "❌ Redirected to login page — Chrome profile session expired. "
-                    f"current_url={current}"
+                    f"❌ Redirected to login page — Buffer session expired or "
+                    f"Chrome profile loaded without cookies.\n"
+                    f"   current_url={current}"
                 )
                 return False
 
             url_ok = (not expected_fragment) or (expected_fragment in current)
 
-            # صبر سخاوتمندانه برای hydrate شدن React (بدون هیچ refresh)
+            # Wait for the Buffer React shell to fully hydrate (no refresh!)
             page_ready = self._wait_for_buffer_ready(timeout=40)
 
-            # URL ممکن است بعد از redirect عوض شده باشد؛ مجدداً بخوانیم
+            # Re-read URL after the hydration wait (SPA may have redirected)
             current = self.driver.current_url or ""
             if self._is_login_page(current):
-                print(f"❌ Login redirect detected after wait → {current}")
+                print(f"❌ Login redirect detected after hydration wait → {current}")
                 return False
             url_ok = (not expected_fragment) or (expected_fragment in current)
+
+            self._log_page_state(f"final state attempt {attempt}")
 
             if url_ok and page_ready:
                 print(f"✅ Navigation successful: {current}")
                 return True
 
             print(
-                f"⚠️ Attempt {attempt} failed (url_ok={url_ok}, page_ready={page_ready}, "
-                f"current={current}) — retrying with fresh get..."
+                f"⚠️ Attempt {attempt} failed "
+                f"(url_ok={url_ok}, page_ready={page_ready}) — retrying..."
             )
             time.sleep(3)
 
-        print(f"❌ Failed to navigate to {url} after {retries} attempts")
+        print(f"❌ Could not navigate to {url} after {retries} attempts")
         return False
 
     # ─────────────────────────────

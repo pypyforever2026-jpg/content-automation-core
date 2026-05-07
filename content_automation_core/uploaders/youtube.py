@@ -41,71 +41,167 @@ class YouTubeUploader:
         """Setup Chrome driver with user profile"""
         chrome_options = Options()
 
-        # Add user profile
         chrome_options.add_argument(f"--user-data-dir={self.profile_path}")
-
-        # Additional options for stability
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
 
+        # ── Anti-lock / anti-dialog flags ────────────────────────────────────
+        # Prevents: (a) "Chrome didn't shut down correctly" bubble that blocks
+        # navigation after a quick restart; (b) Chrome opening in guest/temp
+        # profile when the SingletonLock file is still present from the previous
+        # session (which causes driver.get() to leave the browser on the Chrome
+        # new-tab page instead of the requested URL).
+        chrome_options.add_argument("--no-first-run")
+        chrome_options.add_argument("--no-default-browser-check")
+        chrome_options.add_argument("--disable-session-crashed-bubble")
+        chrome_options.add_argument("--disable-restore-session-state")
+        chrome_options.add_argument("--disable-infobars")
+        # ─────────────────────────────────────────────────────────────────────
+
         if self.headless:
             chrome_options.add_argument("--headless")
 
         try:
-            # Initialize driver
             self.driver = webdriver.Chrome(options=chrome_options)
-            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-            # Setup explicit wait
+            self.driver.execute_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
             self.wait = WebDriverWait(self.driver, 30)
-
             self.logger.info("Chrome driver initialized successfully")
 
         except WebDriverException as e:
             self.logger.error(f"Failed to initialize Chrome driver: {e}")
             raise
 
+    # ─────────────────────────────
+    # Browser State Helpers
+    # ─────────────────────────────
+
+    def _is_chrome_stuck(self) -> bool:
+        """
+        Return True when the browser is on a Chrome internal / blank page,
+        meaning driver.get() had no effect.
+
+        Common causes:
+          - Profile SingletonLock still held → Chrome opened in guest mode.
+          - Crash-recovery dialog intercepted navigation.
+        """
+        try:
+            url = self.driver.current_url or ""
+        except Exception:
+            return True
+        return (
+            not url
+            or url.startswith(("chrome://", "about:", "data:", "chrome-error://"))
+        )
+
+    def _log_page_state(self, label: str = "") -> None:
+        """
+        Log the current URL, page title, and a body snippet.
+        Called after every navigation step so logs are self-contained.
+        """
+        try:
+            url = self.driver.current_url or "N/A"
+        except Exception:
+            url = "ERROR"
+        try:
+            title = self.driver.title or "(no title)"
+        except Exception:
+            title = "ERROR"
+        try:
+            body_snippet = self.driver.execute_script(
+                "return (document.body ? document.body.innerText : '').substring(0, 300);"
+            ) or "(empty)"
+        except Exception:
+            body_snippet = "ERROR"
+
+        prefix = f"[{label}] " if label else ""
+        self.logger.info(f"{prefix}URL   : {url}")
+        self.logger.info(f"{prefix}TITLE : {title}")
+        self.logger.info(f"{prefix}BODY  : {body_snippet!r}")
+
     def login(self):
         """
-        Navigate to YouTube Studio and confirm the page is ready.
+        Navigate to YouTube Studio and verify the page is usable before returning.
 
-        Bug fixed: previously current_url was read immediately after driver.get()
-        before the redirect completed, causing the page state check to be wrong
-        (could appear as blank Chrome page) while actually still loading.
+        Problems that caused the "stuck on Chrome home" symptom:
+          1. current_url was read IMMEDIATELY after driver.get() — before any
+             HTTP redirect had time to resolve, so the check saw the wrong URL.
+          2. If Chrome opened in guest mode (profile lock), driver.get() left
+             the browser on chrome://new-tab-page permanently.
+          3. No retry when Studio wasn't reached on the first attempt.
 
-        Now we:
-          1. Navigate to studio.youtube.com directly (more stable than /upload).
-          2. Wait up to 15s for the URL to settle on a YouTube domain.
-          3. Retry up to 3 times if something unexpected happens.
-          4. Verify the Studio shell element is present before continuing.
+        This version:
+          - Detects Chrome internal pages and retries with JS navigation.
+          - Logs full page state (URL + title + body) at every step so failures
+            are immediately diagnosable.
+          - Retries up to 3 times before giving up.
+          - Waits up to 5 minutes for manual Google login if needed.
         """
         self.logger.info("Navigating to YouTube Studio...")
 
-        for attempt in range(1, 4):
-            self.driver.get("https://studio.youtube.com")
+        target = "https://studio.youtube.com"
 
-            # Wait for redirect to resolve — do NOT read current_url immediately.
+        for attempt in range(1, 4):
+            self.logger.info(f"Login attempt {attempt}/3")
+            try:
+                self.driver.get(target)
+            except Exception as e:
+                self.logger.error(f"driver.get({target}) raised: {e}")
+                self._log_page_state(f"login attempt {attempt} after failed get")
+                time.sleep(5)
+                continue
+
+            # Give redirect time to resolve (do NOT read current_url immediately)
             time.sleep(5)
+            self._log_page_state(f"login attempt {attempt} after get+5s")
+
+            # ── Chrome internal page? driver.get() had no effect ─────────
+            if self._is_chrome_stuck():
+                current = self.driver.current_url or ""
+                self.logger.error(
+                    f"Chrome is stuck on internal page: '{current}'\n"
+                    f"  Likely cause: SingletonLock still held (profile in use) "
+                    f"or crash-recovery dialog blocked navigation.\n"
+                    f"  Trying JS navigation fallback..."
+                )
+                try:
+                    self.driver.execute_script(
+                        "window.location.href = arguments[0];", target
+                    )
+                    time.sleep(5)
+                    self._log_page_state(f"login attempt {attempt} after JS fallback")
+                except Exception as js_e:
+                    self.logger.error(f"JS navigation also failed: {js_e}")
+
+                if self._is_chrome_stuck():
+                    self.logger.error(
+                        "Still on Chrome internal page — "
+                        "Chrome profile may still be locked. Retrying..."
+                    )
+                    time.sleep(4)
+                    continue
+            # ─────────────────────────────────────────────────────────────
 
             current_url = self.driver.current_url or ""
-            self.logger.info(f"Current URL after navigation (attempt {attempt}): {current_url}")
 
             if "accounts.google.com" in current_url or "signin" in current_url:
                 self.logger.info(
-                    "Redirected to Google login page — "
-                    "waiting up to 5 minutes for manual login..."
+                    "Redirected to Google login — "
+                    "waiting up to 5 minutes for manual sign-in..."
                 )
                 try:
                     WebDriverWait(self.driver, 300).until(
                         EC.url_contains("studio.youtube.com")
                     )
-                    self.logger.info("Login successful!")
+                    self.logger.info("Manual login completed successfully!")
+                    self._log_page_state("after manual login")
                     break
                 except TimeoutException:
-                    self.logger.error("Login timed out — cannot proceed.")
+                    self.logger.error("Login wait timed out after 5 minutes.")
                     return
 
             elif "studio.youtube.com" in current_url:
@@ -119,16 +215,32 @@ class YouTubeUploader:
                 time.sleep(3)
                 continue
 
-        # Verify the Studio shell is actually rendered (upload button visible)
-        try:
-            WebDriverWait(self.driver, 20).until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//ytcs-app | //ytcp-app | //*[@id='upload-btn'] | //input[@type='file']")
+        # Final sanity check: wait for any Studio UI element to be present.
+        studio_ready_selectors = [
+            "//ytcs-app",
+            "//ytcp-app",
+            "//*[@id='upload-btn']",
+            "//input[@type='file']",
+            "//*[@id='avatar-btn']",
+        ]
+        studio_ready = False
+        for sel in studio_ready_selectors:
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.XPATH, sel))
                 )
+                self.logger.info(f"YouTube Studio UI confirmed ready (selector: {sel})")
+                studio_ready = True
+                break
+            except TimeoutException:
+                continue
+
+        if not studio_ready:
+            self.logger.warning(
+                "No Studio UI element detected — page may not be fully loaded. "
+                "Proceeding anyway but upload may fail."
             )
-            self.logger.info("YouTube Studio UI ready.")
-        except TimeoutException:
-            self.logger.warning("Studio UI element not detected; proceeding anyway.")
+            self._log_page_state("login final state — Studio UI not confirmed")
 
         time.sleep(3)
 
