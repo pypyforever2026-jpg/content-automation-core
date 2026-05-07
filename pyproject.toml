@@ -1,6 +1,6 @@
 [project]
 name = "content-automation-core"
-version = "0.1.36"
+version = "0.1.37"
 description = "Automation tools for content generation and uploading"
 readme = "README.md"
 requires-python = ">=3.10"

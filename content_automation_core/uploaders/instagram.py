@@ -99,16 +99,19 @@ class InstagramUploader:
             time.sleep(0.5)
         return False
 
-    def navigate_to(self, url: str, retries: int = 4, wait_sec: int = 10) -> bool:
+    def navigate_to(self, url: str, retries: int = 3, initial_wait: int = 5) -> bool:
         """
-        Navigate به URL با retry قوی.
+        Navigate به URL با retry.
 
-        بهبودها نسبت به نسخه قبل:
-        - علاوه بر URL، منتظر یک عنصر واقعی Buffer می‌ماند (نه فقط URL).
-        - در صورت ریدایرکت به login، فوراً متوقف می‌شود و خطای واضح می‌دهد
-          (دیگر بی‌نهایت تلاش بیخود نمی‌کند).
-        - بین تلاش‌ها یک‌بار refresh هم انجام می‌دهد.
-        - expected_fragment فقط وقتی استفاده می‌شود که URL واقعاً buffer.com باشد.
+        هر تلاش:
+          1. driver.get(url)
+          2. صبر initial_wait ثانیه تا redirect/session cookie اعمال شود
+          3. بررسی login redirect (fail fast)
+          4. _wait_for_buffer_ready با timeout=40s — React SPA بافر روی cold-browser
+             می‌تواند ۲۰-۳۰ ثانیه طول بکشد و باید صبر کافی داشته باشیم.
+
+        مهم: هیچ driver.refresh() بین تلاش‌ها نیست. refresh حین لود SPA
+        را interrupt می‌کند و باعث می‌شود همان چرخه تکرار شود.
         """
         if "buffer.com" in url:
             expected_fragment = url.split("buffer.com", 1)[-1].rstrip("/")
@@ -121,51 +124,41 @@ class InstagramUploader:
                 self.driver.get(url)
             except Exception as e:
                 print(f"⚠️ driver.get failed: {e}")
-                time.sleep(3)
+                time.sleep(5)
                 continue
 
-            time.sleep(wait_sec)
+            # کوچکترین صبر اولیه تا redirect کامل شود
+            time.sleep(initial_wait)
             current = self.driver.current_url or ""
 
-            # 1) ریدایرکت به login → بدون login نمی‌شود ادامه داد، fail سریع.
+            # ریدایرکت به login → نشانه‌ی session منقضی شده
             if self._is_login_page(current):
                 print(
-                    "❌ Redirected to login page — Chrome profile is not authenticated to Buffer. "
+                    "❌ Redirected to login page — Chrome profile session expired. "
                     f"current_url={current}"
                 )
                 return False
 
-            # 2) بررسی URL (در صورت داشتن fragment معتبر)
             url_ok = (not expected_fragment) or (expected_fragment in current)
 
-            # 3) بررسی واقعی بودن صفحه (عنصر Create موجود است؟)
-            page_ready = self._wait_for_buffer_ready(timeout=12)
+            # صبر سخاوتمندانه برای hydrate شدن React (بدون هیچ refresh)
+            page_ready = self._wait_for_buffer_ready(timeout=40)
+
+            # URL ممکن است بعد از redirect عوض شده باشد؛ مجدداً بخوانیم
+            current = self.driver.current_url or ""
+            if self._is_login_page(current):
+                print(f"❌ Login redirect detected after wait → {current}")
+                return False
+            url_ok = (not expected_fragment) or (expected_fragment in current)
 
             if url_ok and page_ready:
                 print(f"✅ Navigation successful: {current}")
                 return True
 
             print(
-                f"⚠️ Navigation not confirmed yet (url_ok={url_ok}, page_ready={page_ready}, "
-                f"current={current}) — retrying..."
+                f"⚠️ Attempt {attempt} failed (url_ok={url_ok}, page_ready={page_ready}, "
+                f"current={current}) — retrying with fresh get..."
             )
-
-            # تلاش وسطی: یک‌بار refresh قبل از get مجدد
-            try:
-                self.driver.refresh()
-                time.sleep(wait_sec)
-                current = self.driver.current_url or ""
-                if self._is_login_page(current):
-                    print(f"❌ After refresh: redirected to login → {current}")
-                    return False
-                url_ok = (not expected_fragment) or (expected_fragment in current)
-                page_ready = self._wait_for_buffer_ready(timeout=10)
-                if url_ok and page_ready:
-                    print(f"✅ Navigation successful after refresh: {current}")
-                    return True
-            except Exception as e:
-                print(f"⚠️ refresh failed: {e}")
-
             time.sleep(3)
 
         print(f"❌ Failed to navigate to {url} after {retries} attempts")

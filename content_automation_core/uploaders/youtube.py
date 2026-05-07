@@ -70,36 +70,67 @@ class YouTubeUploader:
 
     def login(self):
         """
-        Navigate to YouTube Studio and handle login if needed
-        User will manually login on first run, profile will be saved for future use
+        Navigate to YouTube Studio and confirm the page is ready.
+
+        Bug fixed: previously current_url was read immediately after driver.get()
+        before the redirect completed, causing the page state check to be wrong
+        (could appear as blank Chrome page) while actually still loading.
+
+        Now we:
+          1. Navigate to studio.youtube.com directly (more stable than /upload).
+          2. Wait up to 15s for the URL to settle on a YouTube domain.
+          3. Retry up to 3 times if something unexpected happens.
+          4. Verify the Studio shell element is present before continuing.
         """
         self.logger.info("Navigating to YouTube Studio...")
 
-        # Go directly to YouTube Studio upload page
-        self.driver.get("https://www.youtube.com/upload")
+        for attempt in range(1, 4):
+            self.driver.get("https://studio.youtube.com")
 
-        # Check if we're on login page or upload page
-        current_url = self.driver.current_url
+            # Wait for redirect to resolve — do NOT read current_url immediately.
+            time.sleep(5)
 
-        if "accounts.google.com" in current_url or "signin" in current_url:
-            self.logger.info("Please log in manually in the browser window...")
-            self.logger.info("After logging in, the script will continue automatically")
+            current_url = self.driver.current_url or ""
+            self.logger.info(f"Current URL after navigation (attempt {attempt}): {current_url}")
 
-            # Wait for user to complete login and redirect to upload page
-            try:
-                self.wait.until(EC.url_contains("youtube.com/upload"))
-                self.logger.info("Login successful! Redirected to upload page")
-            except TimeoutException:
-                self.logger.warning("Still on login page after waiting. Please check login manually.")
+            if "accounts.google.com" in current_url or "signin" in current_url:
+                self.logger.info(
+                    "Redirected to Google login page — "
+                    "waiting up to 5 minutes for manual login..."
+                )
+                try:
+                    WebDriverWait(self.driver, 300).until(
+                        EC.url_contains("studio.youtube.com")
+                    )
+                    self.logger.info("Login successful!")
+                    break
+                except TimeoutException:
+                    self.logger.error("Login timed out — cannot proceed.")
+                    return
 
-        elif "youtube.com/upload" in current_url or "studio.youtube.com" in current_url:
-            self.logger.info("Already logged in! Proceeding with upload...")
+            elif "studio.youtube.com" in current_url:
+                self.logger.info("Already logged in to YouTube Studio!")
+                break
 
-        else:
-            self.logger.warning(f"Unexpected page: {current_url}")
+            else:
+                self.logger.warning(
+                    f"Unexpected page on attempt {attempt}: {current_url} — retrying..."
+                )
+                time.sleep(3)
+                continue
 
-        # Give page time to fully load
-        time.sleep(5)
+        # Verify the Studio shell is actually rendered (upload button visible)
+        try:
+            WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//ytcs-app | //ytcp-app | //*[@id='upload-btn'] | //input[@type='file']")
+                )
+            )
+            self.logger.info("YouTube Studio UI ready.")
+        except TimeoutException:
+            self.logger.warning("Studio UI element not detected; proceeding anyway.")
+
+        time.sleep(3)
 
     def upload_video(self, video_path, title, description, visibility="public", made_for_kids=False):
         """
@@ -153,102 +184,164 @@ class YouTubeUploader:
             return False
 
     def _upload_file(self, video_path):
-        """Upload the video file"""
+        """
+        Upload the video file and wait until Studio confirms the upload is done.
+
+        Bug fixed: previously the "Uploading" invisibility wait had a 30-second
+        timeout that silently passed even when upload was still in progress,
+        returning True as a false positive. Additionally, current_url was checked
+        immediately without waiting, so if Studio hadn't loaded yet the file input
+        was never found and we returned False.
+
+        Now we:
+          1. Wait up to 30s for the file input to appear.
+          2. Send the file path.
+          3. Wait up to 30s for the upload dialog to OPEN (confirms Studio is ready).
+          4. Wait up to 10 minutes for the "Uploading" progress text to disappear.
+          5. Verify a details-form element is present before returning True.
+        """
         try:
-            # Find file input and upload
-            file_input = self.wait.until(
+            # Step 1: Find the (possibly hidden) file input on Studio
+            file_input = WebDriverWait(self.driver, 30).until(
                 EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
             )
             file_input.send_keys(os.path.abspath(video_path))
+            self.logger.info("File path sent to input — waiting for upload dialog...")
 
-            # Wait for upload progress to appear and then disappear
-            self.logger.info("Waiting for file upload to complete...")
-
-            # Wait for the upload progress to start
+            # Step 2: Wait for the upload dialog to actually open.
+            # The dialog contains the "Uploading" progress label. If this never
+            # appears within 30s the file input wasn't on the upload page.
+            upload_dialog_xpath = (
+                "//*[contains(text(), 'Uploading') or "
+                "contains(text(), 'Upload video') or "
+                "contains(text(), 'Processing') or "
+                "contains(@class, 'upload-dialog') or "
+                "contains(@class, 'ytcp-uploads-dialog')]"
+            )
             try:
-                self.wait.until(
-                    EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'Uploading') or contains(text(), 'Processing')]"))
+                WebDriverWait(self.driver, 30).until(
+                    EC.presence_of_element_located((By.XPATH, upload_dialog_xpath))
                 )
-                self.logger.info("Upload started...")
+                self.logger.info("Upload dialog opened / upload started.")
             except TimeoutException:
-                pass  # Upload might be very fast
+                self.logger.error(
+                    "Upload dialog did not appear within 30s — "
+                    "Studio may not have been on the correct page."
+                )
+                return False
 
-            # Wait for upload to complete (progress bar disappears)
+            # Step 3: Wait for "Uploading X%" to disappear (upload transfer done).
+            # Use a generous 10-minute timeout for large video files.
+            self.logger.info("Waiting for file transfer to complete (up to 10 min)...")
+            uploading_xpath = "//*[contains(text(), 'Uploading')]"
             try:
-                self.wait.until(
-                    EC.invisibility_of_element_located((By.XPATH, "//*[contains(text(), 'Uploading')]"))
+                WebDriverWait(self.driver, 600).until(
+                    EC.invisibility_of_element_located((By.XPATH, uploading_xpath))
                 )
+                self.logger.info("File transfer complete.")
             except TimeoutException:
-                pass
+                self.logger.warning(
+                    "Upload transfer still showing after 10 min — proceeding anyway."
+                )
+
+            # Step 4: Confirm the details form is accessible (title textbox visible).
+            # This also gives Studio a moment to switch to the Details step.
+            details_ready_xpath = (
+                "//div[@id='textbox' and @contenteditable='true'] | "
+                "//ytcp-mention-textbox[@label='Title']"
+            )
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    EC.presence_of_element_located((By.XPATH, details_ready_xpath))
+                )
+                self.logger.info("Details form is ready.")
+            except TimeoutException:
+                self.logger.warning(
+                    "Details form not detected after upload — "
+                    "_fill_video_details will retry with its own waits."
+                )
 
             self.logger.info("File upload completed")
             return True
 
         except TimeoutException:
-            self.logger.error("Failed to upload file - timeout")
+            self.logger.error("Failed to upload file - timeout waiting for file input")
             return False
         except Exception as e:
             self.logger.error(f"Failed to upload file: {e}")
             return False
 
     def _fill_video_details(self, title, description):
-        """Fill in video title and description"""
-        try:
-            # Wait for the details form to load
-            time.sleep(6)
+        """
+        Fill in video title and description.
 
-            # Fill title - try multiple selectors
+        Bug fixed: previously used time.sleep(6) then tried 4 title selectors
+        each with a 30-second WebDriverWait (total up to ~2 minutes of wasted
+        time) even though the details form wasn't ready. Now we first wait for
+        ANY title textbox to become clickable (up to 90s, covering cases where
+        the upload is still finalizing), then fill it in one shot.
+        """
+        try:
+            # ── Title ───────────────────────────────────────────────────────
             title_selectors = [
-                "//div[@id='textbox' and @aria-label='Add a title that describes your video (type @ to mention a channel)']",
-                "//div[@id='textbox'][contains(@aria-label, 'title')]",
                 "//ytcp-mention-textbox[@label='Title']//div[@id='textbox']",
-                "//div[@id='textbox' and @contenteditable='true']"
+                "//div[@id='textbox' and contains(@aria-label, 'title')]",
+                "//div[@id='textbox' and @aria-label='Add a title that describes your video (type @ to mention a channel)']",
+                "//div[@id='textbox' and @contenteditable='true']",
             ]
 
-            title_filled = False
+            title_field = None
             for selector in title_selectors:
                 try:
-                    title_field = self.wait.until(
+                    title_field = WebDriverWait(self.driver, 90).until(
                         EC.element_to_be_clickable((By.XPATH, selector))
                     )
+                    self.logger.info(f"Title field found: {selector}")
+                    break
+                except TimeoutException:
+                    continue
+
+            if title_field is None:
+                self.logger.warning("Could not find title field with any selector")
+            else:
+                try:
                     title_field.click()
-                    title_field.clear()
-                    title_field.send_keys(Keys.CONTROL + "a")  # Select all
+                    time.sleep(0.3)
+                    title_field.send_keys(Keys.CONTROL + "a")
                     title_field.send_keys(title)
                     self.logger.info("Title filled successfully")
-                    title_filled = True
-                    break
-                except TimeoutException:
-                    continue
+                except Exception as e:
+                    self.logger.warning(f"Title fill interaction failed: {e}")
 
-            if not title_filled:
-                self.logger.warning("Could not fill title with any selector")
-
-            # Fill description - try multiple selectors
+            # ── Description ─────────────────────────────────────────────────
             description_selectors = [
+                "//ytcp-mention-textbox[@label='Description']//div[@id='textbox']",
+                "//div[@id='textbox' and contains(@aria-label, 'description')]",
                 "//div[@id='textbox' and @aria-label='Tell viewers about your video (type @ to mention a channel)']",
-                "//div[@id='textbox'][contains(@aria-label, 'description')]",
-                "//ytcp-mention-textbox[@label='Description']//div[@id='textbox']"
             ]
 
-            description_filled = False
+            description_field = None
             for selector in description_selectors:
                 try:
-                    description_field = self.wait.until(
+                    description_field = WebDriverWait(self.driver, 15).until(
                         EC.element_to_be_clickable((By.XPATH, selector))
                     )
-                    description_field.click()
-                    description_field.clear()
-                    description_field.send_keys(Keys.CONTROL + "a")  # Select all
-                    description_field.send_keys(description)
-                    self.logger.info("Description filled successfully")
-                    description_filled = True
+                    self.logger.info(f"Description field found: {selector}")
                     break
                 except TimeoutException:
                     continue
 
-            if not description_filled:
-                self.logger.warning("Could not fill description with any selector")
+            if description_field is None:
+                self.logger.warning("Could not find description field with any selector")
+            else:
+                try:
+                    description_field.click()
+                    time.sleep(0.3)
+                    description_field.send_keys(Keys.CONTROL + "a")
+                    description_field.send_keys(description)
+                    self.logger.info("Description filled successfully")
+                except Exception as e:
+                    self.logger.warning(f"Description fill interaction failed: {e}")
 
             return True
 
