@@ -39,9 +39,7 @@ import time
 import uuid
 from typing import Optional
 
-from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -329,10 +327,13 @@ class YouTubeUploader:
                 f"— continuing anyway"
             )
 
-        # Wait for the details form
+        # Wait for the details form (Studio uses ytcp-social-suggestion-input +
+        # contenteditable #textbox, not legacy ytcp-mention-textbox).
         details_xpath = (
-            "//div[@id='textbox' and @contenteditable='true'] | "
-            "//ytcp-mention-textbox[@label='Title']"
+            "//div[@id='textbox' and contains(@aria-label, 'Add a title')]"
+            " | //ytcp-form-input-container[.//span[@id='label-text' "
+            "and contains(., 'Title')]]//div[@id='textbox']"
+            " | //ytcp-mention-textbox[@label='Title']"
         )
         try:
             safe_driver_call(
@@ -352,13 +353,21 @@ class YouTubeUploader:
     # ── Step: fill title/description ───────────────────────────────────────
 
     def _fill_video_details(self, title: str, description: str) -> bool:
+        # Current Studio UI: ytcp-social-suggestions-textbox → div#textbox
+        # (contenteditable). Legacy upload flow still has ytcp-mention-textbox.
         title_selectors = (
+            "//ytcp-form-input-container[.//span[@id='label-text' "
+            "and contains(., 'Title')]]//div[@id='textbox'][@contenteditable='true']",
+            "//div[@id='textbox' and @role='textbox' "
+            "and contains(@aria-label, 'Add a title')]",
+            "//div[@id='textbox' and contains(@aria-label, 'title that describes')]",
+            "//ytcp-social-suggestions-textbox//div[@id='textbox' and @aria-required='true']",
             "//ytcp-mention-textbox[@label='Title']//div[@id='textbox']",
-            "//div[@id='textbox' and contains(@aria-label, 'title')]",
-            "//div[@id='textbox' and @contenteditable='true']",
         )
 
-        title_field = self._wait_first_clickable(title_selectors, timeout=90)
+        title_field = self._wait_first_element(
+            title_selectors, timeout=90, clickable=False
+        )
         if title_field is None:
             logger.warning(f"{self.log_prefix}[DETAILS] title field not found")
         else:
@@ -368,10 +377,16 @@ class YouTubeUploader:
                 logger.warning(f"{self.log_prefix}[DETAILS] title fill failed")
 
         description_selectors = (
+            "//ytcp-form-input-container[.//span[@id='label-text' "
+            "and normalize-space(.)='Description']]"
+            "//div[@id='textbox'][@contenteditable='true']",
+            "//div[@id='textbox' and @role='textbox' "
+            "and contains(@aria-label, 'Tell viewers about')]",
             "//ytcp-mention-textbox[@label='Description']//div[@id='textbox']",
-            "//div[@id='textbox' and contains(@aria-label, 'description')]",
         )
-        description_field = self._wait_first_clickable(description_selectors, timeout=15)
+        description_field = self._wait_first_element(
+            description_selectors, timeout=30, clickable=False
+        )
         if description_field is None:
             logger.warning(f"{self.log_prefix}[DETAILS] description field not found")
         else:
@@ -379,15 +394,35 @@ class YouTubeUploader:
                 logger.info(f"{self.log_prefix}[DETAILS] description filled")
         return True
 
-    def _wait_first_clickable(self, xpaths, timeout: int):
-        """Return the first XPath element to become clickable within timeout."""
+    def _wait_first_element(
+        self,
+        xpaths,
+        timeout: int,
+        *,
+        clickable: bool = False,
+    ):
+        """Try each XPath in order with a shared wall-clock budget.
+
+        Polymer contenteditable fields often fail ``element_to_be_clickable``
+        (overlays, shadow boundaries). For title/description use
+        ``clickable=False`` (presence only); ``safe_send_keys`` scrolls and
+        dismisses overlays before typing.
+        """
+        if not xpaths:
+            return None
+        deadline = time.time() + timeout
+        ec = EC.element_to_be_clickable if clickable else EC.presence_of_element_located
         for xp in xpaths:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            per = max(1.0, min(25.0, remaining))
             try:
                 el = safe_driver_call(
-                    lambda x=xp: WebDriverWait(self.session.driver, timeout).until(
-                        EC.element_to_be_clickable((By.XPATH, x))
+                    lambda x=xp, p=per: WebDriverWait(self.session.driver, p).until(
+                        ec((By.XPATH, x))
                     ),
-                    timeout=timeout + 5,
+                    timeout=per + 5,
                 )
                 if el is not None:
                     return el
