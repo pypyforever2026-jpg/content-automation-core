@@ -35,6 +35,7 @@ from ._browser import (
     SCRIPT_TIMEOUT,
     run_with_upload_timeout,
     safe_driver_call,
+    setup_logging,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ class TikTokUploader:
     """TikTok uploader (cookies-based, no Chrome profile)."""
 
     def __init__(self, cookies_file: Optional[str] = None, headless: bool = False):
+        setup_logging("uploader.log")
         self.cookies_file = cookies_file
         self.headless = headless
         self.upload_id = uuid.uuid4().hex[:8]
@@ -215,6 +217,121 @@ class TikTokUploader:
             pass
         return False
 
+    # ── upload page navigation ─────────────────────────────────────────────
+
+    _UPLOAD_URLS = (
+        "https://www.tiktok.com/tiktok-studio/upload",
+        "https://www.tiktok.com/upload",
+        "https://www.tiktok.com/creator-center/upload",
+    )
+
+    def _find_input_in_main_or_iframe(self, timeout: float):
+        """Look for ``input[type=file]`` in the top doc; if not found, scan
+        each iframe for the same selector. Returns the WebElement or None.
+
+        IMPORTANT: when the input is found inside an iframe, we leave the
+        driver focused on that iframe so subsequent interactions
+        (Got it, description, Post) still work. We only restore default
+        content if NO input was found.
+        """
+        end = time.time() + timeout
+        # main doc
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        try:
+            el = WebDriverWait(self.driver, max(1.0, min(8.0, end - time.time()))).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "input[type='file']")
+                )
+            )
+            if el is not None:
+                return el
+        except Exception:
+            pass
+
+        # iframes
+        try:
+            iframes = self.driver.find_elements(By.CSS_SELECTOR, "iframe")
+        except Exception:
+            iframes = []
+        for frame in iframes:
+            if time.time() >= end:
+                break
+            try:
+                self.driver.switch_to.default_content()
+                self.driver.switch_to.frame(frame)
+            except Exception:
+                continue
+            try:
+                el = WebDriverWait(self.driver, 4).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "input[type='file']")
+                    )
+                )
+                if el is not None:
+                    src = ""
+                    try:
+                        src = frame.get_attribute("src") or ""
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"{self.log_prefix}[FILE] input found in iframe src={src!r}"
+                    )
+                    return el
+            except Exception:
+                continue
+
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        return None
+
+    def _reach_upload_page_and_find_input(self):
+        """Try TikTok upload URLs in order; for each, search top-doc + iframes
+        for a file input. Returns the WebElement or None.
+
+        Logs the actual URL we land on so login redirects are visible.
+        """
+        for url in self._UPLOAD_URLS:
+            try:
+                safe_driver_call(
+                    lambda u=url: self.driver.get(u),
+                    timeout=PAGE_LOAD_TIMEOUT + 5,
+                )
+            except Exception as e:
+                logger.warning(f"{self.log_prefix}[NAV] get({url}) failed: {e}")
+                continue
+            time.sleep(4)
+            try:
+                current = self.driver.current_url
+            except Exception:
+                current = ""
+            logger.info(f"{self.log_prefix}[NAV] landed at {current}")
+            low = (current or "").lower()
+            if "login" in low or "/signup" in low:
+                logger.error(
+                    f"{self.log_prefix}[NAV] redirected to login — cookies invalid"
+                )
+                return None
+            el = self._find_input_in_main_or_iframe(timeout=20)
+            if el is not None:
+                return el
+            logger.warning(
+                f"{self.log_prefix}[FILE] input not on this page — trying next URL"
+            )
+        try:
+            current = self.driver.current_url
+        except Exception:
+            current = ""
+        logger.error(
+            f"{self.log_prefix}[FILE] input not found on any upload URL "
+            f"(last_url={current!r})"
+        )
+        return None
+
     # ── main upload ────────────────────────────────────────────────────────
 
     def upload(self, video_path: str, description: str = "") -> bool:
@@ -232,25 +349,8 @@ class TikTokUploader:
             self.setup_driver()
             self.load_cookies()
 
-            try:
-                safe_driver_call(
-                    lambda: self.driver.get("https://www.tiktok.com/upload"),
-                    timeout=PAGE_LOAD_TIMEOUT + 5,
-                )
-            except Exception as e:
-                logger.error(f"{self.log_prefix}[UPLOAD] navigation failed: {e}")
-                return False
-            time.sleep(5)
-
-            # Attach file
-            try:
-                file_input = WebDriverWait(self.driver, 20).until(
-                    EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, "input[type='file']")
-                    )
-                )
-            except Exception as e:
-                logger.error(f"{self.log_prefix}[FILE] input not found: {e}")
+            file_input = self._reach_upload_page_and_find_input()
+            if file_input is None:
                 return False
             try:
                 safe_driver_call(

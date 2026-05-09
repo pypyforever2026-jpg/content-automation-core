@@ -64,6 +64,31 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 logger = logging.getLogger(__name__)
 
+
+def setup_logging(log_file: str = "uploader.log") -> None:
+    """Idempotent root logger setup shared by all uploaders.
+
+    Adds a StreamHandler (stdout) and a FileHandler at INFO level only if
+    the root logger has no handlers yet. Safe to call from every uploader
+    constructor — no duplicate handlers, no duplicate lines.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        if root.level > logging.INFO or root.level == logging.NOTSET:
+            root.setLevel(logging.INFO)
+        return
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+    try:
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except OSError:
+        pass
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Hard limits
 # ─────────────────────────────────────────────────────────────────────────────

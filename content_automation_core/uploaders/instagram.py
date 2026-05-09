@@ -53,6 +53,7 @@ from ._browser import (
     SAFE_COMMAND_TIMEOUT,
     run_with_upload_timeout,
     safe_driver_call,
+    setup_logging,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ class InstagramUploader:
     """
 
     def __init__(self, profile_path: str, buffer_url: str) -> None:
+        setup_logging("uploader.log")
         self.profile_path = profile_path
         self.buffer_url = buffer_url
         self.upload_id = uuid.uuid4().hex[:8]

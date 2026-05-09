@@ -54,6 +54,7 @@ from ._browser import (
     SAFE_COMMAND_TIMEOUT,
     run_with_upload_timeout,
     safe_driver_call,
+    setup_logging,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,18 +64,8 @@ YT_UPLOAD_URL = "https://www.youtube.com/upload"
 
 
 def _setup_root_logging_once():
-    """Backward-compat: previous version called logging.basicConfig() in __init__."""
-    root = logging.getLogger()
-    if root.handlers:
-        return
-    root.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    fh = logging.FileHandler("youtube_upload.log")
-    fh.setFormatter(fmt)
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    root.addHandler(fh)
-    root.addHandler(sh)
+    """Backward-compat shim — delegates to the shared setup_logging()."""
+    setup_logging("youtube_upload.log")
 
 
 class YouTubeUploader:
