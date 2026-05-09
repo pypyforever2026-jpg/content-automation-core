@@ -29,6 +29,9 @@ Public API is unchanged:
         .upload_video(video_path, title, description, visibility, made_for_kids)
         .close()
     upload_video_to_youtube(video_path, title, description, ...)
+
+    ``made_for_kids`` is accepted for compatibility but does not change Studio
+    audience / kids selection (channel defaults apply).
 """
 
 from __future__ import annotations
@@ -208,14 +211,19 @@ class YouTubeUploader:
         visibility: str = "public",
         made_for_kids: bool = False,
     ) -> bool:
-        """Run the upload pipeline. Always returns within GLOBAL_UPLOAD_TIMEOUT."""
+        """Run the upload pipeline. Always returns within GLOBAL_UPLOAD_TIMEOUT.
+
+        ``made_for_kids`` is kept for backward compatibility only; the uploader
+        does not change audience / kids settings (Studio channel defaults apply).
+        """
+        _ = made_for_kids
         if not os.path.exists(video_path):
             logger.error(f"{self.log_prefix} video file not found: {video_path}")
             return False
 
         return run_with_upload_timeout(
             worker_fn=lambda: self._upload_video_inner(
-                video_path, title, description, visibility, made_for_kids
+                video_path, title, description, visibility
             ),
             get_session_fn=lambda: self.session,
             timeout_sec=GLOBAL_UPLOAD_TIMEOUT,
@@ -228,14 +236,11 @@ class YouTubeUploader:
         title: str,
         description: str,
         visibility: str,
-        made_for_kids: bool,
     ) -> bool:
         try:
             if not self._upload_file(video_path):
                 return False
             if not self._fill_video_details(title, description):
-                return False
-            if not self._set_kids_content(made_for_kids):
                 return False
             if not self._navigate_upload_workflow():
                 return False
@@ -431,38 +436,6 @@ class YouTubeUploader:
             except Exception:
                 continue
         return None
-
-    # ── Step: kids content (COPPA) ─────────────────────────────────────────
-
-    def _set_kids_content(self, made_for_kids: bool) -> bool:
-        target_name = (
-            "VIDEO_MADE_FOR_KIDS_MFK" if made_for_kids else "VIDEO_MADE_FOR_KIDS_NOT_MFK"
-        )
-        selectors = (
-            f"//tp-yt-paper-radio-button[@name='{target_name}']",
-            f"//paper-radio-button[@name='{target_name}']",
-            f"//*[@name='{target_name}']",
-        )
-        for xp in selectors:
-            try:
-                radio = safe_driver_call(
-                    lambda x=xp: WebDriverWait(self.session.driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, x))
-                    ),
-                    timeout=15,
-                )
-                if radio is not None and self.session.safe_click(radio):
-                    logger.info(
-                        f"{self.log_prefix}[COPPA] set made_for_kids={made_for_kids}"
-                    )
-                    time.sleep(1.5)
-                    return True
-            except DriverUnhealthyError:
-                raise
-            except Exception:
-                continue
-        logger.error(f"{self.log_prefix}[COPPA] could not set kids selection")
-        return False
 
     # ── Step: walk through Next buttons ────────────────────────────────────
 
@@ -707,7 +680,11 @@ def upload_video_to_youtube(
     """
     One-shot function-style upload. Always cleanly closes the browser, even
     on exception or timeout. Returns True/False.
+
+    ``made_for_kids`` is accepted for API compatibility; audience / kids
+    settings are not changed by the uploader.
     """
+    _ = made_for_kids
     uploader = YouTubeUploader(profile_path=profile_path, headless=headless)
     try:
         uploader.setup_driver()
