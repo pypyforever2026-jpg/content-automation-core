@@ -1,601 +1,697 @@
+"""
+Instagram (Buffer) uploader.
+
+Refactored to use the centralized ``_browser.BrowserSession`` for stability.
+
+What was wrong before, what is fixed now:
+
+  - PROCESS LEAKS:    every relaunch could leave orphan chrome.exe processes
+                      because driver.quit() was sometimes hung. Now each
+                      session.start() begins by killing every chrome.exe
+                      using the same --user-data-dir, and force_close()
+                      always kills processes if quit() failed.
+  - INFINITE WAITS:   webdriver commands could block for hours via urllib3
+                      retries. Now every command is wrapped in
+                      safe_driver_call(...) with a hard wall-clock timeout.
+  - RELAUNCH STORMS:  recursive fallback loops kept spawning Chrome instances
+                      that hit the same Buffer onboarding overlay. Now there
+                      is exactly ONE bounded recreate loop (max 2 recreates)
+                      and overlays are dismissed before every click.
+  - FALSE NAV OK:     navigate_to() trusted Buffer's URL. Now navigation
+                      succeeds only when readyState=='complete' AND the URL
+                      is not chrome:// / about:blank / chrome-error://.
+  - NO GLOBAL CAP:    a single Buffer hang could block the queue for hours.
+                      Now upload_reels() is guarded by GLOBAL_UPLOAD_TIMEOUT
+                      (15 minutes); on expiry we force-close and return False.
+
+Public API is unchanged:
+    InstagramUploader(profile_path, buffer_url).upload_reels(file_path, caption)
+    upload_instagram_reels(file_path, caption, profile_path, buffer_url)
+"""
+
+from __future__ import annotations
+
+import logging
 import os
-import time
 import subprocess
-from selenium import webdriver
+import time
+import uuid
+from typing import Optional
+
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
+from ._browser import (
+    BrowserSession,
+    DriverUnhealthyError,
+    GLOBAL_UPLOAD_TIMEOUT,
+    MAX_DRIVER_RECREATIONS,
+    NavigationError,
+    SAFE_COMMAND_TIMEOUT,
+    run_with_upload_timeout,
+    safe_driver_call,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Clipboard helper (unchanged — needed for Persian captions)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _set_clipboard_windows(text: str) -> bool:
-    """
-    متن را روی clipboard ویندوز مینویسد.
-    از clip.exe داخلی ویندوز استفاده میکند — بدون ctypes، بدون pip.
-    BOM اضافه میکند تا clip.exe متن را Unicode بخواند (برای فارسی ضروری است).
-    """
+    """Write *text* to the Windows clipboard using clip.exe + UTF-16 LE BOM."""
     try:
-        bom = b"\xff\xfe"  # UTF-16 LE BOM
+        bom = b"\xff\xfe"
         encoded = bom + text.encode("utf-16-le")
         proc = subprocess.Popen("clip", stdin=subprocess.PIPE, shell=True)
         proc.communicate(input=encoded)
         return proc.returncode == 0
     except Exception as e:
-        print(f"⚠️ clip.exe failed: {e}")
+        logger.warning(f"[IG][CLIPBOARD] clip.exe failed: {e}")
         return False
 
 
-WAIT_SEC = 25
+# ─────────────────────────────────────────────────────────────────────────────
+# Login redirect detection
+# ─────────────────────────────────────────────────────────────────────────────
 
+_LOGIN_MARKERS = (
+    "login.buffer.com",
+    "account.buffer.com",
+    "/login",
+    "accounts.google.com",
+    "signin",
+)
+
+_BUFFER_SHELL_SELECTORS = (
+    (By.CSS_SELECTOR, "button[aria-haspopup='menu']"),
+    (By.CSS_SELECTOR, "[data-channel='instagram']"),
+    (By.XPATH, "//button[contains(., 'Create')]"),
+)
+
+
+def _is_login_redirect(url: str) -> bool:
+    if not url:
+        return False
+    u = url.lower()
+    return any(m in u for m in _LOGIN_MARKERS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Uploader
+# ─────────────────────────────────────────────────────────────────────────────
 
 class InstagramUploader:
-    def __init__(self, profile_path: str, buffer_url: str):
+    """
+    Upload an Instagram Reel via Buffer.
+
+    A single InstagramUploader instance owns at most ONE BrowserSession at
+    a time. The recovery policy is bounded: at most MAX_DRIVER_RECREATIONS
+    total recreations of the browser session. There is NO recursive fallback.
+    """
+
+    def __init__(self, profile_path: str, buffer_url: str) -> None:
         self.profile_path = profile_path
         self.buffer_url = buffer_url
-        self.driver = None
+        self.upload_id = uuid.uuid4().hex[:8]
+        self.log_prefix = f"[IG][upload_id={self.upload_id}]"
+        self.session: Optional[BrowserSession] = None
 
-    def build_driver(self):
-        options = Options()
-        options.add_argument(f"user-data-dir={self.profile_path}")
-        options.add_argument("--start-maximized")
-        options.add_argument("--disable-notifications")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        # ── Anti-lock / anti-dialog flags ────────────────────────────────────
-        # Without these, Chrome can:
-        #  (a) Show "Chrome didn't shut down correctly" bubble that blocks nav,
-        #  (b) Detect the profile lock from a previous quick-restart and fall
-        #      back to a guest/temp profile (no session → no cookies → stuck
-        #      on chrome://new-tab-page after every driver.get() call).
-        options.add_argument("--no-first-run")
-        options.add_argument("--no-default-browser-check")
-        options.add_argument("--disable-session-crashed-bubble")
-        options.add_argument("--disable-restore-session-state")
-        options.add_argument("--disable-infobars")
-        # ─────────────────────────────────────────────────────────────────────
-        self.driver = webdriver.Chrome(options=options)
+    # ── session lifecycle ──────────────────────────────────────────────────
 
-    def close_driver(self, lock_wait: int = 4):
-        """
-        Quit the browser and wait for Chrome to release its profile lock.
-
-        Chrome writes a ``SingletonLock`` file inside the profile directory.
-        If we create a new Chrome instance before the old process fully exits
-        and removes that file, the new instance opens without the profile
-        (guest mode, no session) and driver.get() leaves the browser on
-        chrome://new-tab-page.  A short sleep after quit() is the simplest
-        reliable fix.
-        """
-        if self.driver:
+    def _create_session(self) -> BrowserSession:
+        """Force-close any existing session, then start a fresh one."""
+        if self.session is not None:
             try:
-                self.driver.quit()
-            except Exception:
-                pass
-            finally:
-                self.driver = None
-            time.sleep(lock_wait)  # give Chrome time to release SingletonLock
-
-    def wait_for_element(self, by, selector, timeout=WAIT_SEC):
-        return WebDriverWait(self.driver, timeout).until(
-            EC.presence_of_element_located((by, selector))
-        )
-
-    def wait_for_clickable(self, by, selector, timeout=WAIT_SEC):
-        return WebDriverWait(self.driver, timeout).until(
-            EC.element_to_be_clickable((by, selector))
-        )
-
-    def js_click(self, element):
-        """کلیک با JavaScript برای عناصری که با click() عادی کار نمیکنند"""
-        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", element)
-
-    # ─────────────────────────────
-    # Browser State Helpers
-    # ─────────────────────────────
-
-    def _is_chrome_stuck(self) -> bool:
-        """
-        Return True when Chrome is on an internal/blank page instead of the
-        target site — meaning driver.get() had no effect.
-
-        This typically means:
-          - Chrome opened in guest mode due to profile lock (SingletonLock).
-          - A crash-recovery dialog blocked navigation.
-          - The WebDriver connection was re-established on an empty window.
-
-        Internal-page prefixes: chrome://, about:, data:, chrome-error://
-        """
-        try:
-            url = self.driver.current_url or ""
-        except Exception:
-            return True
-        return (
-            not url
-            or url.startswith(("chrome://", "about:", "data:", "chrome-error://"))
-        )
-
-    def _log_page_state(self, label: str = "") -> None:
-        """
-        Print a diagnostic snapshot: URL, page title, and first 250 chars of
-        body text. Use this after every navigation step to make root-cause
-        analysis straightforward when something goes wrong.
-        """
-        try:
-            url = self.driver.current_url or "N/A"
-        except Exception:
-            url = "ERROR reading url"
-        try:
-            title = self.driver.title or "(no title)"
-        except Exception:
-            title = "ERROR reading title"
-        try:
-            body_snippet = self.driver.execute_script(
-                "return (document.body ? document.body.innerText : '').substring(0, 250);"
-            ) or "(empty body)"
-        except Exception:
-            body_snippet = "ERROR reading body"
-
-        prefix = f"[{label}] " if label else ""
-        print(f"{prefix}URL   : {url}")
-        print(f"{prefix}TITLE : {title}")
-        print(f"{prefix}BODY  : {body_snippet!r}")
-
-    def _is_login_page(self, current_url: str) -> bool:
-        """تشخیص ریدایرکت به صفحه login بافر/گوگل."""
-        if not current_url:
-            return False
-        login_markers = (
-            "login.buffer.com",
-            "account.buffer.com",
-            "/login",
-            "accounts.google.com",
-            "signin",
-        )
-        url_lc = current_url.lower()
-        return any(marker in url_lc for marker in login_markers)
-
-    def _wait_for_buffer_ready(self, timeout: int = 25) -> bool:
-        """
-        منتظر می‌مانیم تا shell بافر واقعاً لود شود (دکمه Create یا منوی sidebar).
-        صرفِ تغییر URL کافی نیست؛ خیلی وقت‌ها URL درست است ولی صفحه هنوز سفید است.
-        """
-        ready_selectors = [
-            (By.CSS_SELECTOR, "button[aria-haspopup='menu']"),
-            (By.CSS_SELECTOR, "[data-channel='instagram']"),
-            (By.XPATH, "//button[contains(., 'Create')]"),
-            (By.XPATH, "//button[contains(., 'New Post')]"),
-        ]
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            for by, sel in ready_selectors:
-                try:
-                    el = self.driver.find_element(by, sel)
-                    if el.is_displayed():
-                        return True
-                except Exception:
-                    continue
-            time.sleep(0.5)
-        return False
-
-    def navigate_to(self, url: str, retries: int = 3, initial_wait: int = 5) -> bool:
-        """
-        Navigate to url with thorough verification.
-
-        Each attempt:
-          1. driver.get(url)
-          2. Wait initial_wait seconds for redirect to settle.
-          3. Log full page state (URL + title + body snippet) for diagnostics.
-          4. CRITICAL CHECK: if we're on a Chrome internal page (chrome://newtab,
-             about:blank, etc.), driver.get() had NO effect.  Root causes:
-               - Profile SingletonLock not yet released (profile in use by
-                 another Chrome process → guest mode, no session).
-               - Chrome crash-recovery dialog blocked navigation.
-             In this case we attempt a JS-level navigation fallback.
-             If that also fails, we continue to the next attempt.
-          5. Check for login redirect (Buffer session expired) → fail fast.
-          6. Wait up to 40s for the Buffer React shell to render.
-          7. Log final state and return True/False.
-
-        No driver.refresh() is ever called inside this method — it would
-        interrupt React SPA hydration and guarantee repeated failures.
-        """
-        if "buffer.com" in url:
-            expected_fragment = url.split("buffer.com", 1)[-1].rstrip("/")
-        else:
-            expected_fragment = ""
-
-        for attempt in range(1, retries + 1):
-            print(f"🔗 Navigate attempt {attempt}/{retries} → {url}")
-            try:
-                self.driver.get(url)
+                self.session.force_close()
             except Exception as e:
-                print(f"⚠️ driver.get() raised: {e}")
-                self._log_page_state(f"after failed get attempt {attempt}")
-                time.sleep(5)
-                continue
+                logger.warning(f"{self.log_prefix}[BROWSER] cleanup raised: {e}")
+            self.session = None
 
-            time.sleep(initial_wait)
-            self._log_page_state(f"after driver.get attempt {attempt}")
+        s = BrowserSession(self.profile_path, log_prefix=self.log_prefix)
+        s.start()
+        self.session = s
+        return s
 
-            # ── CRITICAL: Chrome internal page detection ─────────────────
-            if self._is_chrome_stuck():
-                current = self.driver.current_url or ""
-                print(
-                    f"⚠️ Chrome is stuck on internal page: '{current}'\n"
-                    f"   Likely cause: profile SingletonLock still held by previous "
-                    f"Chrome process, or crash-recovery dialog.\n"
-                    f"   Attempting JS-level navigation fallback..."
-                )
-                try:
-                    self.driver.execute_script(
-                        "window.location.href = arguments[0];", url
-                    )
-                    time.sleep(initial_wait + 2)
-                    self._log_page_state(f"after JS navigate attempt {attempt}")
-                except Exception as js_e:
-                    print(f"⚠️ JS navigation also raised: {js_e}")
+    # ── public API ─────────────────────────────────────────────────────────
 
-                if self._is_chrome_stuck():
-                    print(
-                        f"❌ Still on Chrome internal page after JS fallback — "
-                        f"this attempt cannot proceed. Retrying..."
-                    )
-                    time.sleep(3)
-                    continue
-            # ─────────────────────────────────────────────────────────────
-
-            current = self.driver.current_url or ""
-
-            # Login redirect = session expired → no point retrying same URL
-            if self._is_login_page(current):
-                print(
-                    f"❌ Redirected to login page — Buffer session expired or "
-                    f"Chrome profile loaded without cookies.\n"
-                    f"   current_url={current}"
-                )
-                return False
-
-            url_ok = (not expected_fragment) or (expected_fragment in current)
-
-            # Wait for the Buffer React shell to fully hydrate (no refresh!)
-            page_ready = self._wait_for_buffer_ready(timeout=40)
-
-            # Re-read URL after the hydration wait (SPA may have redirected)
-            current = self.driver.current_url or ""
-            if self._is_login_page(current):
-                print(f"❌ Login redirect detected after hydration wait → {current}")
-                return False
-            url_ok = (not expected_fragment) or (expected_fragment in current)
-
-            self._log_page_state(f"final state attempt {attempt}")
-
-            if url_ok and page_ready:
-                print(f"✅ Navigation successful: {current}")
-                return True
-
-            print(
-                f"⚠️ Attempt {attempt} failed "
-                f"(url_ok={url_ok}, page_ready={page_ready}) — retrying..."
-            )
-            time.sleep(3)
-
-        print(f"❌ Could not navigate to {url} after {retries} attempts")
-        return False
-
-    # ─────────────────────────────
-    # Composer
-    # ─────────────────────────────
-    def _open_composer(self) -> bool:
+    def upload_reels(self, file_path: str, caption: str) -> bool:
         """
-        تلاش برای باز کردن composer (Create new → Post). دو مسیر UI جدید و قدیم
-        را امتحان می‌کند و True/False برمی‌گرداند تا فراخواننده بتواند retry کند.
-        """
-        # New UI
-        try:
-            create_btn = self.wait_for_clickable(
-                By.CSS_SELECTOR, "button[aria-haspopup='menu']", timeout=15
-            )
-            create_btn.click()
-            time.sleep(1)
-            post_item = self.wait_for_clickable(
-                By.XPATH, "//div[@role='menuitem' and contains(., 'Post')]", timeout=10
-            )
-            post_item.click()
-            print("✅ New UI: Create new → Post")
-            return True
-        except Exception as e:
-            print(f"🕹 New UI failed ({e}) — trying old UI fallback")
+        Upload a Reel. Always returns within GLOBAL_UPLOAD_TIMEOUT seconds.
 
-        # Old UI fallback
-        try:
-            insta_btn = self.wait_for_clickable(
-                By.CSS_SELECTOR, "[data-channel='instagram']", timeout=10
-            )
-            insta_btn.click()
-            new_post_btn = self.wait_for_clickable(
-                By.XPATH, "//button[contains(., 'New')]", timeout=10
-            )
-            new_post_btn.click()
-            print("✅ Old UI: Instagram → New")
-            return True
-        except Exception as e:
-            print(f"❌ Old UI fallback also failed: {e}")
-            return False
-
-    # ─────────────────────────────
-    # Main Actions
-    # ─────────────────────────────
-    def upload_reels(self, file_path: str, caption: str, max_relaunch: int = 2) -> bool:
-        """
-        Upload یک Reel به Buffer.
-
-        max_relaunch: اگر navigate یا open_composer شکست بخورد، driver کاملاً
-        بسته و دوباره باز می‌شود (تا max_relaunch بار). این مهم‌ترین لایه‌ی
-        مقاومت در برابر باگ «به URL نمی‌رود» است.
+        Wraps the inner upload logic in run_with_upload_timeout so that, if
+        anything (Buffer SPA, chromedriver, network) hangs, the browser is
+        force-killed and we return False cleanly.
         """
         file_path = os.path.abspath(file_path)
+        if not os.path.exists(file_path):
+            logger.error(f"{self.log_prefix} video file not found: {file_path}")
+            return False
 
-        for relaunch_attempt in range(max_relaunch + 1):
-            self.build_driver()
-            try:
-                if not self.navigate_to(self.buffer_url):
-                    print(
-                        f"❌ Could not reach Buffer URL "
-                        f"(relaunch {relaunch_attempt}/{max_relaunch})"
-                    )
-                    self.close_driver()
-                    if relaunch_attempt < max_relaunch:
-                        print("🔄 Relaunching browser from scratch...")
-                        time.sleep(3)
-                        continue
-                    return False
+        return run_with_upload_timeout(
+            worker_fn=lambda: self._upload_reels_inner(file_path, caption),
+            get_session_fn=lambda: self.session,
+            timeout_sec=GLOBAL_UPLOAD_TIMEOUT,
+            log_prefix=self.log_prefix,
+        )
 
-                if not self._open_composer():
-                    print(
-                        f"❌ Could not open composer "
-                        f"(relaunch {relaunch_attempt}/{max_relaunch})"
-                    )
-                    self.close_driver()
-                    if relaunch_attempt < max_relaunch:
-                        print("🔄 Relaunching browser from scratch...")
-                        time.sleep(3)
-                        continue
-                    return False
+    # ── inner upload (no timeout management) ───────────────────────────────
 
-                # navigate + composer هر دو اوکی → از حلقه‌ی relaunch خارج شو
-                break
-            except Exception as e:
-                print(f"⚠️ Unexpected error during navigate/composer: {e}")
-                self.close_driver()
-                if relaunch_attempt < max_relaunch:
-                    print("🔄 Relaunching browser from scratch...")
-                    time.sleep(3)
-                    continue
-                return False
+    def _upload_reels_inner(self, file_path: str, caption: str) -> bool:
+        """
+        Bounded-recovery upload pipeline.
 
+        Up to (MAX_DRIVER_RECREATIONS + 1) attempts. Each attempt:
+          1. Create a fresh session (kills old chrome processes first).
+          2. Navigate to Buffer URL.
+          3. Verify Buffer shell is rendered and we are not on a login page.
+          4. Open composer, attach file, write caption, schedule Now,
+             click Publish, and verify success.
+        Returns True on the first success.
+        """
         try:
-            time.sleep(2)
+            for attempt in range(MAX_DRIVER_RECREATIONS + 1):
+                logger.info(
+                    f"{self.log_prefix}[ATTEMPT] {attempt + 1}"
+                    f"/{MAX_DRIVER_RECREATIONS + 1}"
+                )
 
-            # ❷ انتخاب Reels
-            try:
-                reels_label = self.wait_for_clickable(By.CSS_SELECTOR, "label[for='reels']")
-                reels_label.click()
-                print("✅ Reels clicked")
-            except Exception:
-                print("⚠️ Reels click failed")
+                try:
+                    session = self._create_session()
+                except Exception as e:
+                    logger.error(f"{self.log_prefix}[BROWSER] start failed: {e}")
+                    continue
 
-            # ❸ آپلود فایل (با wait تا input واقعاً ظاهر بشود)
-            try:
-                upload_input = WebDriverWait(self.driver, 20).until(
+                # Navigation — strict
+                try:
+                    final_url = session.navigate(self.buffer_url)
+                except (NavigationError, DriverUnhealthyError) as e:
+                    logger.warning(f"{self.log_prefix}[NAV] {e} — recreating")
+                    continue
+
+                if _is_login_redirect(final_url):
+                    logger.error(
+                        f"{self.log_prefix}[NAV] Buffer session expired "
+                        f"(login redirect) — aborting upload"
+                    )
+                    return False
+
+                if not session.is_healthy():
+                    logger.warning(f"{self.log_prefix}[HEALTH] driver unhealthy after nav")
+                    continue
+
+                # Buffer shell render — bounded wait, no relaunch on overlay
+                if not self._wait_for_buffer_shell(session):
+                    logger.warning(f"{self.log_prefix}[NAV] Buffer shell did not render")
+                    continue
+
+                # From this point on, treat any unhealthy/nav exception as a
+                # failure for this attempt only — recreate one more time if
+                # we have budget.
+                try:
+                    if self._run_composer_pipeline(session, file_path, caption):
+                        return True
+                except DriverUnhealthyError as e:
+                    logger.warning(
+                        f"{self.log_prefix}[HEALTH] driver hung mid-upload: {e}"
+                    )
+                    continue
+                except Exception as e:
+                    logger.exception(
+                        f"{self.log_prefix}[ERROR] composer pipeline raised: {e}"
+                    )
+                    continue
+
+            logger.error(
+                f"{self.log_prefix} upload failed after "
+                f"{MAX_DRIVER_RECREATIONS + 1} attempt(s)"
+            )
+            return False
+        finally:
+            if self.session is not None:
+                try:
+                    self.session.force_close()
+                except Exception as e:
+                    logger.warning(f"{self.log_prefix}[BROWSER] final close: {e}")
+                self.session = None
+
+    # ── pipeline steps ─────────────────────────────────────────────────────
+
+    def _wait_for_buffer_shell(self, session: BrowserSession, timeout: int = 30) -> bool:
+        """Wait for any well-known Buffer shell element to appear AND be visible."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not session.is_healthy():
+                return False
+            # Always remove overlays mid-poll so we don't time out behind them.
+            session.dismiss_blocking_overlays()
+            for by, sel in _BUFFER_SHELL_SELECTORS:
+                try:
+                    el = safe_driver_call(
+                        lambda: session.driver.find_element(by, sel),
+                        timeout=5,
+                    )
+                    if el is not None:
+                        try:
+                            visible = safe_driver_call(el.is_displayed, timeout=5)
+                        except Exception:
+                            visible = False
+                        if visible:
+                            return True
+                except Exception:
+                    continue
+            time.sleep(0.7)
+        return False
+
+    def _run_composer_pipeline(
+        self, session: BrowserSession, file_path: str, caption: str
+    ) -> bool:
+        """The composer → file → caption → schedule → publish pipeline."""
+        # 1. Open composer
+        if not self._open_composer(session):
+            return False
+
+        # 2. Click "Reels" tab (best effort)
+        self._select_reels_tab(session)
+
+        # 3. Attach file
+        if not self._attach_file(session, file_path):
+            return False
+
+        # 4. Caption (best effort — uploads still work without caption)
+        if caption:
+            self._write_caption(session, caption)
+
+        # 5. Schedule → Now
+        if not self._set_schedule_now(session):
+            logger.warning(
+                f"{self.log_prefix}[SCHEDULE] failed to set 'Now' — Publish "
+                f"button may not become available"
+            )
+            return False
+
+        # 6. Click Publish + verify
+        if not self._click_publish(session):
+            return False
+
+        return self._verify_publish_succeeded(session, timeout=90)
+
+    def _open_composer(self, session: BrowserSession) -> bool:
+        """
+        Open Buffer's composer. Tries the new UI ("Create new" button)
+        first, falls back to the old UI (Instagram channel → New).
+        Always dismisses overlays before each click.
+        """
+        # New UI
+        session.dismiss_blocking_overlays()
+        try:
+            create_btn = safe_driver_call(
+                lambda: WebDriverWait(session.driver, 15).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "button[aria-haspopup='menu']")
+                    )
+                ),
+                timeout=20,
+            )
+            if create_btn is not None and session.safe_click(create_btn):
+                time.sleep(1)
+                session.dismiss_blocking_overlays()
+                post_item = safe_driver_call(
+                    lambda: WebDriverWait(session.driver, 10).until(
+                        EC.presence_of_element_located(
+                            (By.XPATH, "//div[@role='menuitem' and contains(., 'Post')]")
+                        )
+                    ),
+                    timeout=15,
+                )
+                if post_item is not None and session.safe_click(post_item):
+                    logger.info(f"{self.log_prefix}[COMPOSER] new UI opened")
+                    return True
+        except DriverUnhealthyError:
+            raise
+        except Exception as e:
+            logger.debug(f"{self.log_prefix}[COMPOSER] new UI failed: {e}")
+
+        # Old UI fallback (best effort, no recursion)
+        session.dismiss_blocking_overlays()
+        try:
+            insta_btn = safe_driver_call(
+                lambda: WebDriverWait(session.driver, 10).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "[data-channel='instagram']")
+                    )
+                ),
+                timeout=15,
+            )
+            if insta_btn is not None and session.safe_click(insta_btn):
+                session.dismiss_blocking_overlays()
+                new_btn = safe_driver_call(
+                    lambda: WebDriverWait(session.driver, 10).until(
+                        EC.presence_of_element_located(
+                            (By.XPATH, "//button[contains(., 'New')]")
+                        )
+                    ),
+                    timeout=15,
+                )
+                if new_btn is not None and session.safe_click(new_btn):
+                    logger.info(f"{self.log_prefix}[COMPOSER] old UI opened")
+                    return True
+        except DriverUnhealthyError:
+            raise
+        except Exception as e:
+            logger.debug(f"{self.log_prefix}[COMPOSER] old UI failed: {e}")
+
+        logger.error(f"{self.log_prefix}[COMPOSER] could not open composer")
+        return False
+
+    def _select_reels_tab(self, session: BrowserSession) -> None:
+        session.dismiss_blocking_overlays()
+        try:
+            label = safe_driver_call(
+                lambda: WebDriverWait(session.driver, 10).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "label[for='reels']")
+                    )
+                ),
+                timeout=15,
+            )
+            if label is not None and session.safe_click(label):
+                logger.info(f"{self.log_prefix}[REELS] tab selected")
+        except DriverUnhealthyError:
+            raise
+        except Exception as e:
+            logger.debug(f"{self.log_prefix}[REELS] tab click skipped: {e}")
+
+    def _attach_file(self, session: BrowserSession, file_path: str) -> bool:
+        try:
+            file_input = safe_driver_call(
+                lambda: WebDriverWait(session.driver, 25).until(
                     EC.presence_of_element_located(
                         (By.CSS_SELECTOR, "input[type='file']")
                     )
-                )
-                upload_input.send_keys(file_path)
-                print("📁 File uploaded")
-                time.sleep(3)
-            except Exception as e:
-                print(f"⚠️ File upload failed: {e}")
-                return False
+                ),
+                timeout=30,
+            )
+        except DriverUnhealthyError:
+            raise
+        except Exception as e:
+            logger.error(f"{self.log_prefix}[FILE] input not found: {e}")
+            return False
 
-            # ❹ نوشتن کپشن
-            if caption:
-                try:
-                    # چند selector مختلف امتحان میکنیم (Buffer UI ممکنه تغییر کنه)
-                    caption_selectors = [
-                        "[data-testid='composer-text-area']",
-                        ".public-DraftEditor-content",
-                        "div[contenteditable='true']",
-                        "div[role='textbox']",
-                    ]
-                    caption_box = None
-                    for sel in caption_selectors:
-                        try:
-                            caption_box = WebDriverWait(self.driver, 8).until(
-                                EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                            )
-                            print(f"✅ Caption box found via: {sel}")
-                            break
-                        except Exception:
-                            continue
+        try:
+            safe_driver_call(
+                lambda: file_input.send_keys(file_path),
+                timeout=SAFE_COMMAND_TIMEOUT,
+            )
+        except DriverUnhealthyError:
+            raise
+        except Exception as e:
+            logger.error(f"{self.log_prefix}[FILE] send_keys failed: {e}")
+            return False
 
-                    if caption_box is None:
-                        print("⚠️ Caption box not found — skipping caption")
-                    else:
-                        # ── کلیک برای فوکوس ──
-                        caption_box.click()
-                        time.sleep(0.4)
+        logger.info(f"{self.log_prefix}[FILE] attached")
+        time.sleep(3)
+        return True
 
-                        # ── Ctrl+A برای پاک کردن محتوای قبلی ──
-                        actions = ActionChains(self.driver)
-                        actions.key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
-                        time.sleep(0.2)
-
-                        # ── استراتژی ۱: clipboard + Ctrl+V ──
-                        clip_ok = _set_clipboard_windows(caption)
-                        time.sleep(0.4)  # صبر تا clip.exe تمام کند
-
-                        if clip_ok:
-                            actions2 = ActionChains(self.driver)
-                            actions2.key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-                            time.sleep(0.5)
-                            print("✅ Caption pasted via clipboard (Ctrl+V)")
-                        else:
-                            # ── استراتژی ۲: send_keys مستقیم (fallback) ──
-                            print("⚠️ Clipboard failed — falling back to send_keys")
-                            caption_box.send_keys(caption)
-                            time.sleep(0.5)
-                            print("✅ Caption written via send_keys")
-
-                except Exception as e:
-                    print(f"⚠️ Caption write failed: {e}")
-
-
-            # ❺ باز کردن منوی Schedule و انتخاب «Now»
+    def _write_caption(self, session: BrowserSession, caption: str) -> None:
+        session.dismiss_blocking_overlays()
+        caption_selectors = (
+            "[data-testid='composer-text-area']",
+            ".public-DraftEditor-content",
+            "div[contenteditable='true']",
+            "div[role='textbox']",
+        )
+        caption_box = None
+        for sel in caption_selectors:
             try:
-                # ── مرحله ۱: کلیک واقعی روی trigger (نه JS — Radix UI به event واقعی نیاز دارد)
-                schedule_btn = self.wait_for_clickable(
-                    By.CSS_SELECTOR, "button[data-testid='schedule-selector-trigger']"
+                caption_box = safe_driver_call(
+                    lambda s=sel: WebDriverWait(session.driver, 8).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, s))
+                    ),
+                    timeout=10,
                 )
-                schedule_btn.click()
-                print("🖱 Schedule button clicked")
+                if caption_box is not None:
+                    logger.info(f"{self.log_prefix}[CAPTION] found via {sel}")
+                    break
+            except DriverUnhealthyError:
+                raise
+            except Exception:
+                continue
 
-                # ── مرحله ۲: صبر تا منو واقعاً باز بشه (aria-expanded=true)
-                WebDriverWait(self.driver, 10).until(
+        if caption_box is None:
+            logger.warning(f"{self.log_prefix}[CAPTION] textbox not found — skipping")
+            return
+
+        # Focus + clear
+        if not session.safe_click(caption_box):
+            logger.warning(f"{self.log_prefix}[CAPTION] could not focus textbox")
+            return
+
+        try:
+            safe_driver_call(
+                lambda: ActionChains(session.driver)
+                .key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).perform(),
+                timeout=10,
+            )
+        except Exception:
+            pass
+
+        # Strategy 1: clipboard + Ctrl+V (works for Persian)
+        if _set_clipboard_windows(caption):
+            time.sleep(0.4)
+            try:
+                safe_driver_call(
+                    lambda: ActionChains(session.driver)
+                    .key_down(Keys.CONTROL).send_keys("v").key_up(Keys.CONTROL).perform(),
+                    timeout=10,
+                )
+                logger.info(f"{self.log_prefix}[CAPTION] pasted via clipboard")
+                return
+            except DriverUnhealthyError:
+                raise
+            except Exception as e:
+                logger.debug(f"{self.log_prefix}[CAPTION] paste failed: {e}")
+
+        # Strategy 2: send_keys
+        if session.safe_send_keys(caption_box, caption, clear_first=False):
+            logger.info(f"{self.log_prefix}[CAPTION] written via send_keys")
+        else:
+            logger.warning(f"{self.log_prefix}[CAPTION] all strategies failed")
+
+    def _set_schedule_now(self, session: BrowserSession) -> bool:
+        session.dismiss_blocking_overlays()
+        try:
+            sched_btn = safe_driver_call(
+                lambda: WebDriverWait(session.driver, 15).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "button[data-testid='schedule-selector-trigger']")
+                    )
+                ),
+                timeout=20,
+            )
+        except DriverUnhealthyError:
+            raise
+        except Exception as e:
+            logger.warning(f"{self.log_prefix}[SCHEDULE] trigger not found: {e}")
+            return False
+
+        if not session.safe_click(sched_btn):
+            return False
+
+        # Wait for the menu to actually open (aria-expanded=true)
+        try:
+            safe_driver_call(
+                lambda: WebDriverWait(session.driver, 10).until(
                     EC.presence_of_element_located((
                         By.CSS_SELECTOR,
-                        "button[data-testid='schedule-selector-trigger'][aria-expanded='true']"
+                        "button[data-testid='schedule-selector-trigger']"
+                        "[aria-expanded='true']",
                     ))
-                )
-                print("✅ Schedule menu confirmed open")
+                ),
+                timeout=15,
+            )
+        except Exception:
+            logger.warning(f"{self.log_prefix}[SCHEDULE] menu did not open")
+            return False
 
-                # ── مرحله ۳: صبر اضافی برای render شدن آیتمها توسط React
-                time.sleep(2)
+        time.sleep(1.5)  # let menu items hydrate
+        session.dismiss_blocking_overlays()
 
-                # ── مرحله ۴: پیدا کردن div[role='menuitem'] که شامل «Now» است
-                now_menuitem = WebDriverWait(self.driver, 10).until(
+        try:
+            now_item = safe_driver_call(
+                lambda: WebDriverWait(session.driver, 10).until(
                     EC.presence_of_element_located((
                         By.XPATH,
-                        "//div[@role='menuitem'][.//p[normalize-space(text())='Now']]"
+                        "//div[@role='menuitem'][.//p[normalize-space(text())='Now']]",
                     ))
-                )
-                # کلیک واقعی اول، اگر نشد JS fallback
-                try:
-                    now_menuitem.click()
-                except Exception:
-                    self.driver.execute_script("arguments[0].click();", now_menuitem)
-                print("⏱ Publish set to Now")
-                time.sleep(1)
+                ),
+                timeout=15,
+            )
+        except DriverUnhealthyError:
+            raise
+        except Exception as e:
+            logger.warning(f"{self.log_prefix}[SCHEDULE] 'Now' item not found: {e}")
+            return False
 
-            except Exception as e:
-                print(f"⚠️ Schedule/Now click failed: {e}")
+        if not session.safe_click(now_item):
+            return False
+        logger.info(f"{self.log_prefix}[SCHEDULE] set to Now")
+        time.sleep(1)
+        return True
 
-            # ❻ کلیک Publish
-            try:
-                publish_btn = None
-                publish_selectors = [
-                    (By.XPATH, "//button[normalize-space(text())='Share Now']"),
-                    (By.XPATH, "//button[normalize-space(text())='Publish Now']"),
-                    (By.XPATH, "//button[contains(@class,'schedulePostButton')]"),
-                    (By.CSS_SELECTOR, "button[data-testid='publish-button']"),
-                ]
-                for by, sel in publish_selectors:
-                    try:
-                        publish_btn = self.wait_for_clickable(by, sel, timeout=5)
-                        break
-                    except Exception:
-                        continue
-
-                if not publish_btn:
-                    print("⚠️ Publish button not found")
-                    return False
-
-                self.js_click(publish_btn)
-                print("✅ Publish clicked — verifying...")
-
-            except Exception as e:
-                print(f"⚠️ Publish click failed: {e}")
-                return False
-
-            # ❼ تأیید واقعی publish — به جای sleep(30) خام، بسته شدن modal یا
-            # ظهور toast/state موفقیت را چک می‌کنیم.
-            return self._verify_publish_succeeded(timeout=60)
-
-        finally:
-            self.close_driver()
-
-    def _verify_publish_succeeded(self, timeout: int = 60) -> bool:
-        """
-        بعد از کلیک Publish، چک می‌کند که آیا ارسال واقعاً انجام شده یا نه.
-
-        موفقیت یعنی یکی از این‌ها:
-          - Modal/Composer بسته شده (دکمه publish دیگر در DOM نیست/visible نیست).
-          - Toast یا متنی شامل «Sharing now», «Post added», «posted», «scheduled» پیدا شد.
-
-        اگر هیچ‌کدام تو timeout اتفاق نیفتد False برمی‌گرداند تا تماس‌گیرنده
-        بفهمد publish انگار شکست خورده.
-        """
-        success_text_xpath = (
-            "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-            "'abcdefghijklmnopqrstuvwxyz'), 'sharing now') or "
-            "contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-            "'abcdefghijklmnopqrstuvwxyz'), 'post added') or "
-            "contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-            "'abcdefghijklmnopqrstuvwxyz'), 'has been posted') or "
-            "contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-            "'abcdefghijklmnopqrstuvwxyz'), 'successfully posted') or "
-            "contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-            "'abcdefghijklmnopqrstuvwxyz'), 'queued')]"
-        )
-
-        publish_btn_selectors = [
+    def _click_publish(self, session: BrowserSession) -> bool:
+        session.dismiss_blocking_overlays()
+        publish_selectors = (
             (By.XPATH, "//button[normalize-space(text())='Share Now']"),
             (By.XPATH, "//button[normalize-space(text())='Publish Now']"),
             (By.CSS_SELECTOR, "button[data-testid='publish-button']"),
-        ]
+            (By.XPATH, "//button[contains(@class,'schedulePostButton')]"),
+        )
+        publish_btn = None
+        for by, sel in publish_selectors:
+            try:
+                publish_btn = safe_driver_call(
+                    lambda b=by, s=sel: WebDriverWait(session.driver, 6).until(
+                        EC.presence_of_element_located((b, s))
+                    ),
+                    timeout=10,
+                )
+                if publish_btn is not None:
+                    break
+            except DriverUnhealthyError:
+                raise
+            except Exception:
+                continue
 
-        end_time = time.time() + timeout
+        if publish_btn is None:
+            logger.error(f"{self.log_prefix}[PUBLISH] button not found")
+            return False
+
+        if not session.safe_click(publish_btn):
+            logger.error(f"{self.log_prefix}[PUBLISH] click failed")
+            return False
+        logger.info(f"{self.log_prefix}[PUBLISH] clicked")
+        return True
+
+    def _verify_publish_succeeded(
+        self, session: BrowserSession, *, timeout: int = 90
+    ) -> bool:
+        """
+        Verify Buffer accepted the publish.
+
+        Success criteria (any one):
+          - The Publish button disappeared from the DOM (composer closed),
+            AND its label is no longer ``Sharing now…`` (transient state).
+          - A success toast contains "queued" / "shared" / "posted" / etc.
+          - The URL changed away from the composer.
+
+        Returns False on timeout — caller decides whether to retry.
+        """
+        composer_url_marker = "/compose"  # buffer composer route fragment
+
+        publish_btn_selectors = (
+            (By.XPATH, "//button[normalize-space(text())='Share Now']"),
+            (By.XPATH, "//button[normalize-space(text())='Publish Now']"),
+            (By.CSS_SELECTOR, "button[data-testid='publish-button']"),
+        )
+        success_xpath = (
+            "//*[contains(translate(., "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),"
+            " 'sharing now') or "
+            "contains(translate(., "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),"
+            " 'post added') or "
+            "contains(translate(., "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),"
+            " 'has been posted') or "
+            "contains(translate(., "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),"
+            " 'successfully') or "
+            "contains(translate(., "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),"
+            " 'queued') or "
+            "contains(translate(., "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),"
+            " 'shared')]"
+        )
+
+        deadline = time.time() + timeout
         last_log = 0.0
-        while time.time() < end_time:
-            # 1) دکمه Publish دیگر visible نیست → modal بسته شده
-            publish_visible = False
+        while time.time() < deadline:
+            if not session.is_healthy():
+                logger.warning(
+                    f"{self.log_prefix}[VERIFY] driver unhealthy during verify"
+                )
+                return False
+
+            # 1) URL left composer = success
+            current = session.current_url()
+            if current and composer_url_marker not in current.lower():
+                # In the new Buffer UI, on success we are redirected back to the
+                # channel feed which doesn't contain '/compose'.
+                logger.info(
+                    f"{self.log_prefix}[VERIFY] URL left composer: {current}"
+                )
+                return True
+
+            # 2) Publish button gone
+            visible = False
             for by, sel in publish_btn_selectors:
                 try:
-                    el = self.driver.find_element(by, sel)
-                    if el.is_displayed():
-                        publish_visible = True
+                    btn = safe_driver_call(
+                        lambda b=by, s=sel: session.driver.find_element(b, s),
+                        timeout=4,
+                    )
+                    is_disp = False
+                    if btn is not None:
+                        try:
+                            is_disp = bool(
+                                safe_driver_call(btn.is_displayed, timeout=4)
+                            )
+                        except Exception:
+                            is_disp = False
+                    if is_disp:
+                        visible = True
                         break
                 except Exception:
                     continue
-            if not publish_visible:
-                print("✅ Publish modal closed — upload confirmed")
-                # یک کم صبر می‌کنیم تا اگر toast هست هم لود شود
-                time.sleep(3)
+            if not visible:
+                logger.info(f"{self.log_prefix}[VERIFY] publish button gone")
                 return True
 
-            # 2) toast موفقیت ظاهر شد
+            # 3) Success toast
             try:
-                el = self.driver.find_element(By.XPATH, success_text_xpath)
-                if el.is_displayed():
-                    print(f"✅ Publish success toast detected: '{el.text[:80]}'")
+                el = safe_driver_call(
+                    lambda: session.driver.find_element(By.XPATH, success_xpath),
+                    timeout=4,
+                )
+                if el is not None and bool(
+                    safe_driver_call(el.is_displayed, timeout=4)
+                ):
+                    logger.info(f"{self.log_prefix}[VERIFY] success toast detected")
                     return True
             except Exception:
                 pass
 
             now = time.time()
             if now - last_log > 5:
-                print("⏳ Waiting for Buffer to confirm publish...")
+                logger.info(f"{self.log_prefix}[VERIFY] waiting...")
                 last_log = now
             time.sleep(1)
 
-        print("❌ Publish click did not produce a confirmed success within timeout")
+        logger.error(f"{self.log_prefix}[VERIFY] timeout — no success signal")
         return False
 
 
-# ─────────────────────────────
-# Functional API
-# ─────────────────────────────
-def upload_instagram_reels(file_path: str, caption: str, profile_path: str, buffer_url: str) -> bool:
-    uploader = InstagramUploader(profile_path, buffer_url)
-    return uploader.upload_reels(file_path, caption)
+# ─────────────────────────────────────────────────────────────────────────────
+# Functional API (backward compatible)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def upload_instagram_reels(
+    file_path: str, caption: str, profile_path: str, buffer_url: str
+) -> bool:
+    return InstagramUploader(profile_path, buffer_url).upload_reels(file_path, caption)
