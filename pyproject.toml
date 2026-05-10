@@ -1,17 +1,27 @@
 [project]
 name = "content-automation-core"
 version = "0.2.5"
-description = "Automation tools for content generation and uploading"
+description = "Browser automation core for multi-platform content uploads and Gemini image generation"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
 authors = [
   { name = "Soheilll_2006" }
+]
+keywords = ["selenium", "playwright", "automation", "youtube", "tiktok", "instagram", "browser"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Internet :: WWW/HTTP :: Browsers",
 ]
 
 dependencies = [
   "selenium>=4.0.0",
-  "requests>=2.0.0",
-  "webdriver-manager>=4.0.0",
   "playwright>=1.40.0",
   "psutil>=5.9.0"
 ]
