@@ -503,6 +503,24 @@ _GENERIC_BLOCKING_OVERLAY_JS = r"""
         var tag = el.tagName.toLowerCase();
         if (tag === 'html' || tag === 'body' || tag === 'main') continue;
 
+        // CRITICAL: don't remove dialogs / modals / forms.
+        // YouTube Studio's ytcp-uploads-dialog, native <dialog>, role=dialog,
+        // and anything that contains interactive controls (input, textarea,
+        // button, contenteditable) is the page's actual content — never an
+        // overlay we should remove. react-joyride and similar tour
+        // backdrops have NO interactive children, so they still get caught.
+        if (el.getAttribute && (
+            el.getAttribute('role') === 'dialog' ||
+            el.getAttribute('aria-modal') === 'true'
+        )) continue;
+        if (tag === 'dialog') continue;
+        try {
+            if (el.querySelector(
+                'input, textarea, [contenteditable="true"], ' +
+                '[role="textbox"], [role="dialog"], button, form'
+            )) continue;
+        } catch (e) {}
+
         // Capture identifying info BEFORE mutating, for diagnostics.
         var info = {
             tag: tag,
