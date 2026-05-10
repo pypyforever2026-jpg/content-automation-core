@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Clipboard helper (unchanged — needed for Persian captions)
+# Clipboard helper — paste path for captions that send_keys mishandles
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _set_clipboard_windows(text: str) -> bool:
@@ -462,7 +462,7 @@ class InstagramUploader:
         except Exception:
             pass
 
-        # Strategy 1: clipboard + Ctrl+V (works for Persian)
+        # Strategy 1: clipboard + Ctrl+V (works for some scripts send_keys mishandles)
         if _set_clipboard_windows(caption):
             time.sleep(0.4)
             try:

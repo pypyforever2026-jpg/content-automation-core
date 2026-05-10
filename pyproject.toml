@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-  { name = "Soheilll_2006" }
+  { name = "Content Automation Core contributors" }
 ]
 keywords = ["selenium", "playwright", "automation", "youtube", "tiktok", "instagram", "browser"]
 classifiers = [

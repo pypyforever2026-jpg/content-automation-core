@@ -9,7 +9,7 @@ Designed for **reliability under production-style constraints**—bounded timeou
 
 ---
 
-## Why this exists (resume-friendly highlights)
+## Technical highlights
 
 - **Industrial browser session layer** (`uploaders/_browser.py`): thread-bounded WebDriver calls, global per-upload wall-clock caps, normalized path matching for Chrome/`chromedriver` teardown (avoids killing unrelated browser profiles), overlay dismissal without fragile single-site CSS hacks, and crash/hang detection (`is_healthy`, `is_page_healthy`).
 - **Multi-platform upload automation** with explicit failure modes (e.g. YouTube channel appeal / login redirects, TikTok cookie/session expiry, Buffer login detection).
@@ -173,9 +173,3 @@ Automating third-party websites may violate **terms of service** or **acceptable
 ## License
 
 [MIT](LICENSE)
-
----
-
-## نسخه فارسی (خلاصه)
-
-این پکیج یک لایهٔ مشترک برای **اتوماسیون مرورگر** (Selenium + در بخش تصویر Playwright) است با تمرکز روی **پایداری در اجرای طولانی**: محدودیت زمانی برای دستورات، بستن امن مرورگر، و ماژول‌های جدا برای آپلود به **یوتیوب**، **تیک‌تاک** (کوکی)، و **اینستاگرام از مسیر Buffer**. برای رزومه، روی معماری جدا شدن «زیرساخت مرورگر» از «منطق هر پلتفرم» و بحث تایم‌اوت/پاکسازی فرآیند تأکید کنید. ریپوی عمومی جدا را می‌توانید با محتوای همین پوشه بسازید و این README را به‌عنوان توضیح پروژه لینک دهید.
