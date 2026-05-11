@@ -1,6 +1,6 @@
 [project]
 name = "content-automation-core"
-version = "0.2.5"
+version = "0.2.6"
 description = "Browser automation core for multi-platform content uploads and Gemini image generation"
 readme = "README.md"
 requires-python = ">=3.10"

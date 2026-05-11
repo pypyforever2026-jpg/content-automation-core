@@ -42,6 +42,7 @@ import time
 import uuid
 from typing import Optional
 
+from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -361,16 +362,10 @@ class YouTubeUploader:
             "//ytcp-mention-textbox[@label='Title']//div[@id='textbox']",
         )
 
-        title_field = self._wait_first_element(
-            title_selectors, timeout=90, clickable=False
-        )
-        if title_field is None:
-            logger.warning(f"{self.log_prefix}[DETAILS] title field not found")
+        if self._fill_textbox(title_selectors, title, timeout=90, label="title"):
+            logger.info(f"{self.log_prefix}[DETAILS] title filled")
         else:
-            if self.session.safe_send_keys(title_field, title):
-                logger.info(f"{self.log_prefix}[DETAILS] title filled")
-            else:
-                logger.warning(f"{self.log_prefix}[DETAILS] title fill failed")
+            logger.warning(f"{self.log_prefix}[DETAILS] title fill failed")
 
         description_selectors = (
             "//ytcp-form-input-container[.//span[@id='label-text' "
@@ -380,15 +375,46 @@ class YouTubeUploader:
             "and contains(@aria-label, 'Tell viewers about')]",
             "//ytcp-mention-textbox[@label='Description']//div[@id='textbox']",
         )
-        description_field = self._wait_first_element(
-            description_selectors, timeout=30, clickable=False
-        )
-        if description_field is None:
-            logger.warning(f"{self.log_prefix}[DETAILS] description field not found")
+        if self._fill_textbox(
+            description_selectors, description, timeout=30, label="description"
+        ):
+            logger.info(f"{self.log_prefix}[DETAILS] description filled")
         else:
-            if self.session.safe_send_keys(description_field, description):
-                logger.info(f"{self.log_prefix}[DETAILS] description filled")
+            logger.warning(f"{self.log_prefix}[DETAILS] description fill failed")
         return True
+
+    def _fill_textbox(
+        self, xpaths, text: str, *, timeout: int, label: str
+    ) -> bool:
+        """Find a contenteditable textbox and type into it.
+
+        Polymer often re-renders ``ytcp-social-suggestions-textbox`` shortly
+        after the user starts typing into a SIBLING textbox (title → description
+        cascade). The cached WebElement we returned a moment ago can therefore
+        go stale before send_keys completes. We re-find ONCE on stale — not
+        a retry loop — and abort cleanly if it still fails.
+        """
+        for attempt in (1, 2):
+            el = self._wait_first_element(xpaths, timeout=timeout, clickable=False)
+            if el is None:
+                logger.warning(f"{self.log_prefix}[DETAILS] {label} field not found")
+                return False
+            try:
+                if self.session.safe_send_keys(el, text):
+                    return True
+            except StaleElementReferenceException:
+                if attempt == 1:
+                    logger.info(
+                        f"{self.log_prefix}[DETAILS] {label} went stale — re-finding once"
+                    )
+                    continue
+            # safe_send_keys returned False — if first attempt, give Polymer
+            # a moment to settle and try once more.
+            if attempt == 1:
+                time.sleep(0.5)
+                continue
+            return False
+        return False
 
     def _wait_first_element(
         self,
@@ -430,19 +456,24 @@ class YouTubeUploader:
 
     # ── Step: walk through Next buttons ────────────────────────────────────
 
+    _NEXT_BUTTON_XPATH = (
+        "//ytcp-button[@id='next-button']//button"
+        " | //button[@aria-label='Next']"
+        " | //ytcp-button[@id='next-button']"
+        " | //*[@id='next-button']"
+    )
+
     def _navigate_upload_workflow(self) -> bool:
-        """Click "Next" up to 3 times — Details → Video elements → Visibility."""
+        """Click "Next" up to 3 times — Details → Video elements → Checks → Visibility."""
         clicked = 0
-        for step in range(3):
+        for step in range(4):
             time.sleep(2)
-            xp = (
-                "//ytcp-button[@id='next-button'] | "
-                "//*[@id='next-button']"
-            )
             try:
                 btn = safe_driver_call(
                     lambda: WebDriverWait(self.session.driver, 10).until(
-                        EC.presence_of_element_located((By.XPATH, xp))
+                        EC.presence_of_element_located(
+                            (By.XPATH, self._NEXT_BUTTON_XPATH)
+                        )
                     ),
                     timeout=15,
                 )
@@ -455,12 +486,16 @@ class YouTubeUploader:
                 break
 
             try:
+                aria_disabled = safe_driver_call(
+                    lambda: btn.get_attribute("aria-disabled"), timeout=5
+                )
                 disabled = safe_driver_call(
                     lambda: btn.get_attribute("disabled"), timeout=5
                 )
             except Exception:
+                aria_disabled = None
                 disabled = None
-            if disabled:
+            if disabled or (aria_disabled and aria_disabled.lower() == "true"):
                 logger.info(
                     f"{self.log_prefix}[WORKFLOW] Next disabled at step {step + 1} — "
                     f"waiting briefly"
@@ -490,12 +525,15 @@ class YouTubeUploader:
             "scheduled": "SCHEDULED",
         }.get(visibility.lower(), "PUBLIC")
 
+        # tabindex=-1 + Polymer custom element confuses element_to_be_clickable;
+        # use presence and let safe_click do the heavy lifting (scroll + JS click).
         vis_selectors = (
             f"//tp-yt-paper-radio-button[@name='{target}']",
             f"//paper-radio-button[@name='{target}']",
             f"//tp-yt-paper-radio-button[@id='{visibility.lower()}-radio-button']",
             f"//tp-yt-paper-radio-button[contains(@aria-label, "
             f"'{visibility.title()}')]",
+            f"//*[@name='{target}'][@role='radio']",
         )
 
         vis_set = False
@@ -503,7 +541,7 @@ class YouTubeUploader:
             try:
                 el = safe_driver_call(
                     lambda x=xp: WebDriverWait(self.session.driver, 6).until(
-                        EC.element_to_be_clickable((By.XPATH, x))
+                        EC.presence_of_element_located((By.XPATH, x))
                     ),
                     timeout=10,
                 )
@@ -521,10 +559,14 @@ class YouTubeUploader:
 
         time.sleep(1.5)
 
-        # Click Save / Publish
+        # Click Save / Publish — current Studio renders nested <button>
+        # inside <ytcp-button id="done-button">.
         save_selectors = (
+            "//ytcp-button[@id='done-button']//button",
             "//ytcp-button[@id='done-button']",
             "//*[@id='done-button']",
+            "//button[@aria-label='Publish']",
+            "//button[@aria-label='Save']",
             "//button[normalize-space(text())='Publish']",
             "//button[normalize-space(text())='Save']",
         )
@@ -533,11 +575,21 @@ class YouTubeUploader:
             try:
                 el = safe_driver_call(
                     lambda x=xp: WebDriverWait(self.session.driver, 8).until(
-                        EC.element_to_be_clickable((By.XPATH, x))
+                        EC.presence_of_element_located((By.XPATH, x))
                     ),
                     timeout=12,
                 )
-                if el is not None and self.session.safe_click(el):
+                if el is None:
+                    continue
+                try:
+                    aria_disabled = safe_driver_call(
+                        lambda: el.get_attribute("aria-disabled"), timeout=4
+                    )
+                except Exception:
+                    aria_disabled = None
+                if aria_disabled and aria_disabled.lower() == "true":
+                    continue
+                if self.session.safe_click(el):
                     logger.info(f"{self.log_prefix}[PUBLISH] save/publish clicked")
                     clicked = True
                     break
